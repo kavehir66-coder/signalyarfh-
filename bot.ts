@@ -20,7 +20,10 @@ const SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","ADAUSDT","DO
 
 // ---------- persistence (Deno KV) ----------
 let kv: any = null;
-try { kv = await Deno.openKv(); } catch { /* playgrounds may lack KV; fall back to memory */ }
+try { kv = await Deno.openKv(); console.log("[kv] openKv: OK"); }
+catch (e) {
+  console.log("[kv] openKv FAILED:", String(e).slice(0, 150), "-> memory fallback");
+}
 const memSignals: any[] = [];
 const memSubs: number[] = [];
 const memChats = new Map<number, any[]>();
@@ -207,7 +210,11 @@ async function handleMessage(chatId: number, text: string) {
     const cur = await dbGet<string>("model_" + chatId, "glm");
     let list = "✅ /model glm — GLM (پیش‌فرض، سریع)\n";
     if (OPENROUTER_KEY) {
-      const frees = await fetchFreeModels();
+      const frees = (await fetchFreeModels()).filter(m => {
+        // filter models that can't do general chat
+        const bad = /inkling|content-safety|code/i.test(m.id);
+        return !bad;
+      });
       if (frees.length) {
         list += frees.slice(0, 10).map((m, i) =>
           `${("or" + (i+1)) === cur ? "✅" : "▫️"} /model or${i+1} — ${m.name}`).join("\n");
@@ -234,6 +241,7 @@ async function handleMessage(chatId: number, text: string) {
       return "⚠️ شماره نامعتبر. لیست: /models";
     }
     await dbSet("model_" + chatId, "or:" + frees[idx].id);
+    console.log(`[model] user=${chatId} set to or:${frees[idx].id} (frees=${frees.length})`);
     return `✅ هوش مصنوعی تو الان: ${frees[idx].name}`;
   }
   if (text === "/subscribe") {
@@ -257,13 +265,26 @@ async function handleMessage(chatId: number, text: string) {
   const sysMsg = {role:"system", content:"تو سیگنال‌یار هستی، دستیار تحلیل بازار رمزارز به زبان فارسی. کوتاه، دقیق و دوستانه جواب بده. هیچ‌وقت توصیه قطعی سرمایه‌گذاری نکن و یادآوری کن تصمیم با خود کاربر است."};
   try {
     let j: any;
+    console.log(`[chat] user=${chatId} modelKey=${modelKey}`);
+    let usedFallback = false;
     if (modelKey.startsWith("or:") && OPENROUTER_KEY) {
       const r = await fetch(OR_URL, {
         method:"POST",
         headers:{"Content-Type":"application/json","Authorization":`Bearer ${OPENROUTER_KEY}`},
-        body: JSON.stringify({model: modelKey.slice(3), max_tokens:800, messages:[sysMsg, ...h.slice(-8)]})
+        body: JSON.stringify({model: modelKey.slice(3), max_tokens:2000, messages:[sysMsg, ...h.slice(-8)]})
       });
       j = await r.json();
+      console.log(`[chat] or status=${r.status} model=${modelKey.slice(3)} err=${JSON.stringify(j.error ?? null)}`);
+      // model unavailable/broken -> fall back to GLM so user never sees "…"
+      if (!j.choices?.[0]?.message?.content) {
+        usedFallback = true;
+        const r2 = await fetch(LLM_URL, {
+          method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
+          body: JSON.stringify({model:"auto", max_tokens:800, messages:[sysMsg, ...h.slice(-8)]})
+        });
+        j = await r2.json();
+        await dbSet("model_" + chatId, "glm"); // reset broken selection
+      }
     } else {
       const r = await fetch(LLM_URL, {
         method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
@@ -271,7 +292,13 @@ async function handleMessage(chatId: number, text: string) {
       });
       j = await r.json();
     }
-    reply = j.choices?.[0]?.message?.content || "…";
+    let reply = (j.choices?.[0]?.message?.content || "").trim();
+    if (!reply && j.choices?.[0]?.message?.reasoning) {
+      // some models put output in reasoning field
+      reply = j.choices[0].message.reasoning.trim().slice(0, 800);
+    }
+    if (!reply) reply = "…";
+    if (usedFallback) reply = "⚠️ مدل انتخابی‌ت موقتاً در دسترس نبود، با GLM جواب دادم:\n\n" + reply;
   } catch { reply = "⚠️ الان نمی‌تونم جواب بدم، بعداً امتحان کن."; }
   h.push({role:"assistant", content:reply});
   memChats.set(chatId, h.slice(-16));
