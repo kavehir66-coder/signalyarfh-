@@ -157,11 +157,24 @@ async function analyze(sym: string) {
     let side = "نظاره", conf = 55;
     if (score >= 2) { side = "لانگ"; conf = Math.min(60+score*7, 88); }
     else if (score <= -2) { side = "شورت"; conf = Math.min(60+Math.abs(score)*7, 88); }
+    // dynamic risk parameters from ATR (not fixed %) — SL = 2×ATR, TP = 3×ATR (RR ≈ 1:1.5), leverage scales with volatility
+    let riskLine = "";
+    if (side !== "نظاره" && at > 0) {
+      const slPct = (2*at/price)*100, tpPct = (3*at/price)*100;
+      // volatility ratio vs 2% baseline: high vol → lower leverage (min 1x), calm → up to 3x
+      const volFactor = (2*at/price);
+      const lev = Math.max(1, Math.min(3, Math.round((0.02 / Math.max(volFactor, 0.004)) * 10) / 10));
+      const slPrice = side==="لانگ" ? price - 2*at : price + 2*at;
+      const tpPrice = side==="لانگ" ? price + 3*at : price - 3*at;
+      riskLine = `اهرم: ${lev}x | حد ضرر: -${slPct.toFixed(1)}% (${fmt(slPrice)}$) | حد سود: +${tpPct.toFixed(1)}% (${fmt(tpPrice)}$)\n`;
+      reasons.push(`حد ضرر داینامیک بر اساس ATR: -${slPct.toFixed(1)}% / حد سود: +${tpPct.toFixed(1)}% (نسبت 1:1.5)`);
+    }
     const emoji = side==="لانگ"?"🟢":side==="شورت"?"🔴":"⚪";
     const txt = `📈 تحلیل ${sym}\nقیمت: ${price.toLocaleString("en-US")}$\nسمت پیشنهادی: ${side} ${emoji}\nاطمینان: ${conf}%\n`
-      + (side!=="نظاره" ? "اهرم: 2x | حد ضرر: -3% | حد سود: +9%\n" : "")
+      + riskLine
       + reasons.map(x=>"• "+x).join("\n") + "\n\n⚠️ توصیه سرمایه‌گذاری نیست — تصمیم با خودته";
-        return { txt, side, conf, price };
+    console.log(`[analyze] ${sym} ${side} conf=${conf}`);
+    return { txt, side, conf, price, at };
   } catch (e) {
     console.log(`[analyze] ERR ${sym}: ${e instanceof Error ? e.message : String(e)}`);
     return { txt: `⚠️ خطا در تحلیل ${sym}`, side: "نظاره", conf: 55, price: 0 };
@@ -251,10 +264,14 @@ async function handleMessage(chatId: number, text: string) {
       if (s.checked || Date.now()-s.ts < 6*3600e3) continue;
       try {
         const p = await (await fetch(`https://data-api.binance.vision/api/v3/ticker/price?symbol=${s.sym}`)).json();
-        let ch = (Number(p.price)/s.entry-1)*100;
+        const cur = Number(p.price);
+        // dynamic thresholds (stored at signal time) if available, else fixed ±9/−3
+        const tpPct = s.tpPrice ? (s.side==="لانگ" ? (s.tpPrice/s.entry-1)*100 : (s.entry/s.tpPrice-1)*100) : 9;
+        const slPct = s.slPrice ? (s.side==="لانگ" ? (s.slPrice/s.entry-1)*100 : (s.entry/s.slPrice-1)*100) : -3;
+        let ch = (cur/s.entry-1)*100;
         if (s.side === "شورت") ch = -ch;
-        if (ch >= 9) s.result = "win";
-        else if (ch <= -3) s.result = "loss";
+        if (ch >= tpPct) s.result = "win";
+        else if (ch <= slPct) s.result = "loss";
         else if (Date.now()-s.ts > 72*3600e3) s.result = "flat";
         if (s.result) { s.checked = true; changed = true; }
       } catch {}
@@ -395,26 +412,36 @@ async function handleMessage(chatId: number, text: string) {
 Deno.cron("auto signals", "0 */4 * * *", async () => {
   const subs = await dbGet<number[]>("subs", memSubs);
   if (!subs.length) return;
-  const rows: {sc:number,sym:string,p:number}[] = [];
+  const rows: {sc:number,sym:string,p:number,at:number}[] = [];
   for (const sym of SYMBOLS.slice(0,8)) {
     try {
-      const closes = (await klines(sym, "1h", 100)).map(k=>Number(k[4]));
+      const ks = await klines(sym, "1h", 100);
+      const closes = ks.map(k=>Number(k[4]));
       const r = rsi(closes); const [m, s] = macd(closes);
       const sc = (r<35?2:r>70?-2:0)+(m>s?1:-1);
-      if (Math.abs(sc) >= 3) rows.push({sc, sym, p: closes[closes.length-1]});
+      if (Math.abs(sc) >= 3) rows.push({sc, sym, p: closes[closes.length-1], at: atr(ks)});
     } catch {}
   }
   rows.sort((a,b)=>Math.abs(b.sc)-Math.abs(a.sc));
+  const fmt = (v:number, d=2) => v >= 1000 ? v.toLocaleString("en-US",{maximumFractionDigits:0}) : v >= 1 ? v.toLocaleString("en-US",{maximumFractionDigits:d}) : v.toLocaleString("en-US",{maximumFractionDigits:4});
   for (const row of rows.slice(0,2)) {
     const sigs = await dbGet<any[]>("signals", []);
     if (sigs.some(s=>s.sym===row.sym && Date.now()-s.ts < 12*3600e3)) continue;
     const side = row.sc>=3?"لانگ":"شورت";
     const conf = Math.min(60+Math.abs(row.sc)*7, 88);
-    const msg = `🔔 سیگنال خودکار\n${row.sym}: ${side} ${side==="لانگ"?"🟢":"🔴"}\nقیمت: ${row.p.toLocaleString("en-US")}$ | اطمینان: ${conf}%\nاهرم: 2x | حد ضرر: -3% | حد سود: +9%\n\n⚠️ توصیه سرمایه‌گذاری نیست`;
+    // dynamic risk from ATR (same formula as /signal)
+    const slPct = (2*row.at/row.p)*100, tpPct = (3*row.at/row.p)*100;
+    const volFactor = 2*row.at/row.p;
+    const lev = Math.max(1, Math.min(3, Math.round((0.02 / Math.max(volFactor, 0.004)) * 10) / 10));
+    const slPrice = side==="لانگ" ? row.p - 2*row.at : row.p + 2*row.at;
+    const tpPrice = side==="لانگ" ? row.p + 3*row.at : row.p - 3*row.at;
+    const msg = `🔔 سیگنال خودکار\n${row.sym}: ${side} ${side==="لانگ"?"🟢":"🔴"}\nقیمت: ${row.p.toLocaleString("en-US")}$ | اطمینان: ${conf}%\nاهرم: ${lev}x | حد ضرر: -${slPct.toFixed(1)}% (${fmt(slPrice)}$) | حد سود: +${tpPct.toFixed(1)}% (${fmt(tpPrice)}$)\n\n⚠️ توصیه سرمایه‌گذاری نیست`;
     for (const cid of subs) {
       try { await tg("sendMessage", {chat_id: cid, text: msg}); } catch {}
     }
-    sigs.push({sym: row.sym, side, conf, entry: row.p, ts: Date.now(), checked: false, result: null});
+    // store dynamic thresholds so /stats evaluates against REAL SL/TP, not fixed ±%
+    sigs.push({sym: row.sym, side, conf, entry: row.p, ts: Date.now(), checked: false, result: null,
+      slPrice: Number(slPrice.toFixed(8)), tpPrice: Number(tpPrice.toFixed(8))});
     await dbSet("signals", sigs.slice(-500));
   }
 });
