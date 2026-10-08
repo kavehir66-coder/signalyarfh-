@@ -149,7 +149,7 @@ async function analyze(sym: string) {
     else if (bb.pos >= 0.85) { score -= 1; reasons.push(`قیمت نزدیک باند بالای بولینگر (${bb.up.toLocaleString("en-US")}$)`); }
     if (volRatio > 1.5) reasons.push(`حجم بالا (${volRatio.toFixed(1)}x)`);
     reasons.push((ch24>0?"رشد ":"افت ") + `۲۴ساعته ${ch24.toFixed(1)}%`);
-    const fmt = (v:number, d=2) => v >= 1000 ? v.toLocaleString("en-US",{maximumFractionDigits:0}) : v.toLocaleString("en-US",{maximumFractionDigits:d});
+    const fmt = (v:number, d=2) => v >= 1000 ? v.toLocaleString("en-US",{maximumFractionDigits:0}) : v >= 1 ? v.toLocaleString("en-US",{maximumFractionDigits:d}) : v.toLocaleString("en-US",{maximumFractionDigits:4});
     reasons.push(`ATR (نوسان): ${fmt(at,4)}$ — حد ضرر منطقی ≈ ${fmt(price-2*at,4)}$`);
     reasons.push(`حمایت: ${fmt(sr.sup)}$ | مقاومت: ${fmt(sr.res)}$`);
     const fbKey = fb.pos < 0.3 ? "نزدیک ۲۳.۶٪" : fb.pos < 0.45 ? "نزدیک ۳۸.۲٪" : fb.pos < 0.55 ? "نزدیک ۵۰٪" : fb.pos < 0.7 ? "نزدیک ۶۱.۸٪" : "بالای ۶۱.۸٪";
