@@ -288,11 +288,12 @@ async function handleMessage(chatId: number, text: string) {
     } else {
       const r = await fetch(LLM_URL, {
         method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
-        body: JSON.stringify({model:"auto", max_tokens:800, messages:[sysMsg, ...h.slice(-8)]})
+        body: JSON.stringify({model:"auto", max_tokens:2000, messages:[sysMsg, ...h.slice(-8)]})
       });
       j = await r.json();
+      console.log(`[chat] glm status=${r.status} content_len=${(j.choices?.[0]?.message?.content||"").length} err=${JSON.stringify(j.error ?? null)}`);
     }
-    let reply = (j.choices?.[0]?.message?.content || "").trim();
+    reply = (j.choices?.[0]?.message?.content || "").trim();
     if (!reply && j.choices?.[0]?.message?.reasoning) {
       // some models put output in reasoning field
       reply = j.choices[0].message.reasoning.trim().slice(0, 800);
@@ -350,7 +351,9 @@ Deno.serve(async (req: Request) => {
       const m = upd.message;
       if (m?.chat?.id && m.text) {
         const reply = await handleMessage(m.chat.id, m.text);
-        await tg("sendMessage", {chat_id: m.chat.id, text: reply});
+        const sr = await tg("sendMessage", {chat_id: m.chat.id, text: reply});
+        if (!sr.ok) console.log(`[send] FAIL chat=${m.chat.id} err=${JSON.stringify(sr.description ?? sr)}`);
+        else console.log(`[send] ok chat=${m.chat.id} len=${reply.length}`);
       }
     } catch (e) { console.error(e); }
     return new Response("ok");
