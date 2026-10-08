@@ -75,6 +75,42 @@ function ema(vals: number[], period: number): number {
   for (let i = period; i < vals.length; i++) e = vals[i]*k + e*(1-k);
   return e;
 }
+function bollinger(closes: number[], period = 20, mult = 2): {mid:number, up:number, low:number, pos:number} {
+  const s = closes.slice(-period);
+  const mid = s.reduce((a,b)=>a+b,0)/period;
+  const sd = Math.sqrt(s.reduce((a,b)=>a+(b-mid)**2,0)/period);
+  const up = mid + mult*sd, low = mid - mult*sd;
+  const p = closes[closes.length-1];
+  // pos: 0 = at lower band, 1 = at upper band
+  return {mid, up, low, pos: up===low ? 0.5 : (p-low)/(up-low)};
+}
+function atr(ks: number[][], period = 14): number {
+  const trs: number[] = [];
+  for (let i = 1; i < ks.length; i++) {
+    const h = Number(ks[i][2]), l = Number(ks[i][3]), pc = Number(ks[i-1][4]);
+    trs.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc)));
+  }
+  return ema(trs, period);
+}
+function srLevels(closes: number[], lookback = 90): {sup:number, res:number} {
+  const win = closes.slice(-lookback);
+  const p = closes[closes.length-1];
+  const below = win.filter(x=>x<p), above = win.filter(x=>x>p);
+  // nearest support: highest close below price; nearest resistance: lowest above
+  const sup = below.length ? Math.max(...below) : Math.min(...win);
+  const res = above.length ? Math.min(...above) : Math.max(...win);
+  return {sup, res};
+}
+function fib(closes: number[], lookback = 120) {
+  const win = closes.slice(-lookback);
+  const hi = Math.max(...win), lo = Math.min(...win);
+  const d = hi - lo;
+  const p = closes[closes.length-1];
+  const levels: Record<string, number> = {lo, "23.6%": lo+0.236*d, "38.2%": lo+0.382*d, "50%": lo+0.5*d, "61.8%": lo+0.618*d, hi};
+  // where is price relative to the range (0=at low, 1=at high)
+  const pos = d===0 ? 0.5 : (p-lo)/d;
+  return {levels, pos};
+}
 
 // ---------- analysis ----------
 async function analyze(sym: string) {
@@ -85,6 +121,10 @@ async function analyze(sym: string) {
     const price = closes[closes.length-1];
     const r = rsi(closes);
     const [m, s] = macd(closes);
+    const bb = bollinger(closes);
+    const at = atr(ks);
+    const sr = srLevels(closes);
+    const fb = fib(closes);
     const avgVol = vols.slice(-20).reduce((a,b)=>a+b,0)/20 || 1;
     const volRatio = vols[vols.length-1]/avgVol;
     const ch24 = closes.length > 25 ? (price/closes[closes.length-25]-1)*100 : 0;
@@ -93,8 +133,14 @@ async function analyze(sym: string) {
     else if (r > 70) { score -= 2; reasons.push(`RSI اشباع خرید (${r.toFixed(0)})`); }
     else reasons.push(`RSI خنثی (${r.toFixed(0)})`);
     if (m > s) { score += 1; reasons.push("MACD مثبت"); } else { score -= 1; reasons.push("MACD منفی"); }
+    if (bb.pos <= 0.15) { score += 1; reasons.push(`قیمت نزدیک باند پایین بولینگر (${bb.low.toLocaleString("en-US")}$)`); }
+    else if (bb.pos >= 0.85) { score -= 1; reasons.push(`قیمت نزدیک باند بالای بولینگر (${bb.up.toLocaleString("en-US")}$)`); }
     if (volRatio > 1.5) reasons.push(`حجم بالا (${volRatio.toFixed(1)}x)`);
     reasons.push((ch24>0?"رشد ":"افت ") + `۲۴ساعته ${ch24.toFixed(1)}%`);
+    reasons.push(`ATR (نوسان): ${at.toLocaleString("en-US", {maximumFractionDigits: 1})}$ — حد ضرر منطقی ≈ ${(price-2*at).toLocaleString("en-US",{maximumFractionDigits:0})}$`);
+    reasons.push(`حمایت: ${sr.sup.toLocaleString("en-US")}$ | مقاومت: ${sr.res.toLocaleString("en-US")}$`);
+    const fbKey = fb.pos < 0.3 ? "نزدیک ۲۳.۶٪" : fb.pos < 0.45 ? "نزدیک ۳۸.۲٪" : fb.pos < 0.55 ? "نزدیک ۵۰٪" : fb.pos < 0.7 ? "نزدیک ۶۱.۸٪" : "بالای ۶۱.۸٪";
+    reasons.push(`فیبوناچی: ${fbKey} بازه سقف/کف ۵ روز اخیر (سقف ${fb.levels["hi"].toLocaleString("en-US")}$ / کف ${fb.levels["lo"].toLocaleString("en-US")}$)`);
     let side = "نظاره", conf = 55;
     if (score >= 2) { side = "لانگ"; conf = Math.min(60+score*7, 88); }
     else if (score <= -2) { side = "شورت"; conf = Math.min(60+Math.abs(score)*7, 88); }
@@ -271,12 +317,17 @@ async function handleMessage(chatId: number, text: string) {
       const top = SYMBOLS.slice(0, 6);
       for (const sym of top) {
         try {
-          const closes = (await klines(sym, "1h", 100)).map(k=>Number(k[4]));
+          const ks = await klines(sym, "1h", 100);
+          const closes = ks.map(k=>Number(k[4]));
           const p = closes[closes.length-1];
           const r = rsi(closes);
           const [m, s] = macd(closes);
           const chg = ((p / closes[closes.length-25] - 1) * 100);
-          parts.push(`${sym.replace("USDT","")}: قیمت=${p.toLocaleString("en-US")}$، RSI=${r.toFixed(0)}، MACD=${m>s?"مثبت (صعودی)":"منفی (نزولی)"}، تغییر ۲۴ساعت=${chg.toFixed(1)}%`);
+          const bb = bollinger(closes);
+          const sr = srLevels(closes);
+          const fb = fib(closes);
+          const fbKey = fb.pos < 0.45 ? "پایین بازه" : fb.pos < 0.7 ? "میانه بازه" : "بالای بازه";
+          parts.push(`${sym.replace("USDT","")}: قیمت=${p.toLocaleString("en-US")}$، RSI=${r.toFixed(0)}، MACD=${m>s?"مثبت (صعودی)":"منفی (نزولی)"}، تغییر ۲۴ساعت=${chg.toFixed(1)}%، بولینگر=${bb.pos.toFixed(2)} از ۱ (${bb.pos<0.2?"لبه پایین":bb.pos>0.8?"لبه بالا":"میانه"})، حمایت=${sr.sup.toLocaleString("en-US")}$، مقاومت=${sr.res.toLocaleString("en-US")}$، فیبوناچی=${fbKey}`);
         } catch {}
       }
       if (parts.length) marketCtx = "\n\n[داده‌های لحظه‌ای بازار (محاسبه‌شده واقعی از Binance — این اعداد حقیقی‌اند):\n" + parts.join("\n") + "]";
