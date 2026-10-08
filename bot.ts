@@ -1,0 +1,332 @@
+// SignalYar Bot — Deno Deploy version (webhook + cron)
+// Secrets (Deno env): TELEGRAM_TOKEN, LLM_KEY, LLM_URL (optional)
+
+const TOKEN = Deno.env.get("TELEGRAM_TOKEN") ?? "";
+const LLM_KEY = Deno.env.get("LLM_KEY") ?? "";
+const LLM_URL = Deno.env.get("LLM_URL") ?? "https://token.lightvela.ai/v1/chat/completions";
+const OPENROUTER_KEY = Deno.env.get("OPENROUTER_KEY") ?? "";
+const OR_URL = "https://openrouter.ai/api/v1/chat/completions";
+// Free models are fetched live from OpenRouter so the list never goes stale.
+async function fetchFreeModels(): Promise<{id: string, name: string}[]> {
+  try {
+    const r = await fetch("https://openrouter.ai/api/v1/models");
+    const d = await r.json();
+    return (d.data as any[])
+      .filter(m => typeof m.id === "string" && m.id.endsWith(":free"))
+      .map(m => ({id: m.id, name: (m.name || m.id).replace(/\s*\(free\)\s*/i, "")}));
+  } catch { return []; }
+}
+const SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","DOTUSDT"];
+
+// ---------- persistence (Deno KV) ----------
+let kv: any = null;
+try { kv = await Deno.openKv(); } catch { /* playgrounds may lack KV; fall back to memory */ }
+const memSignals: any[] = [];
+const memSubs: number[] = [];
+const memChats = new Map<number, any[]>();
+
+async function dbGet<T>(key: string, def: T): Promise<T> {
+  if (!kv) return def;
+  const r = await kv.get(["sy", key]);
+  return (r.value ?? def) as T;
+}
+async function dbSet(key: string, val: unknown) {
+  if (kv) await kv.set(["sy", key], val);
+}
+
+// ---------- TA ----------
+async function klines(sym: string, interval = "1h", limit = 200): Promise<number[][]> {
+  const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
+  return await r.json();
+}
+function rsi(closes: number[], period = 14): number {
+  const gains: number[] = [], losses: number[] = [];
+  for (let i = 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i-1];
+    gains.push(Math.max(d, 0)); losses.push(Math.max(-d, 0));
+  }
+  if (gains.length < period) return 50;
+  const ag = gains.slice(-period).reduce((a,b)=>a+b,0)/period;
+  const al = losses.slice(-period).reduce((a,b)=>a+b,0)/period;
+  return al === 0 ? 100 : 100 - 100/(1 + ag/al);
+}
+function macd(closes: number[]): [number, number] {
+  const f = closes.slice();
+  const emaSeries = (p: number) => {
+    const k = 2/(p+1); const out: number[] = [];
+    let e = f.slice(0, p).reduce((a,b)=>a+b,0)/p; out.push(e);
+    for (let i = p; i < f.length; i++) { e = f[i]*k + e*(1-k); out.push(e); }
+    return out;
+  };
+  const e12 = emaSeries(12), e26 = emaSeries(26);
+  const n = Math.min(e12.length, e26.length);
+  const line = e12.slice(-n).map((v,i)=>v-e26.slice(-n)[i]);
+  const sig = ema(line.slice(-32), 9);
+  return [line[line.length-1], sig];
+}
+function ema(vals: number[], period: number): number {
+  if (!vals.length) return 0;
+  if (vals.length < period) period = Math.max(1, Math.floor(vals.length/2));
+  const k = 2/(period+1);
+  let e = vals.slice(0, period).reduce((a,b)=>a+b,0)/period;
+  for (let i = period; i < vals.length; i++) e = vals[i]*k + e*(1-k);
+  return e;
+}
+
+// ---------- analysis ----------
+async function analyze(sym: string) {
+  try {
+    const ks = await klines(sym);
+    const closes = ks.map(k => Number(k[4]));
+    const vols = ks.map(k => Number(k[5]));
+    const price = closes[closes.length-1];
+    const r = rsi(closes);
+    const [m, s] = macd(closes);
+    const avgVol = vols.slice(-20).reduce((a,b)=>a+b,0)/20 || 1;
+    const volRatio = vols[vols.length-1]/avgVol;
+    const ch24 = closes.length > 25 ? (price/closes[closes.length-25]-1)*100 : 0;
+    let score = 0; const reasons: string[] = [];
+    if (r < 35) { score += 2; reasons.push(`RSI اشباع فروش (${r.toFixed(0)})`); }
+    else if (r > 70) { score -= 2; reasons.push(`RSI اشباع خرید (${r.toFixed(0)})`); }
+    else reasons.push(`RSI خنثی (${r.toFixed(0)})`);
+    if (m > s) { score += 1; reasons.push("MACD مثبت"); } else { score -= 1; reasons.push("MACD منفی"); }
+    if (volRatio > 1.5) reasons.push(`حجم بالا (${volRatio.toFixed(1)}x)`);
+    reasons.push((ch24>0?"رشد ":"افت ") + `۲۴ساعته ${ch24.toFixed(1)}%`);
+    let side = "نظاره", conf = 55;
+    if (score >= 2) { side = "لانگ"; conf = Math.min(60+score*7, 88); }
+    else if (score <= -2) { side = "شورت"; conf = Math.min(60+Math.abs(score)*7, 88); }
+    const emoji = side==="لانگ"?"🟢":side==="شورت"?"🔴":"⚪";
+    const txt = `📈 تحلیل ${sym}\nقیمت: ${price.toLocaleString("en-US")}$\nسمت پیشنهادی: ${side} ${emoji}\nاطمینان: ${conf}%\n`
+      + (side!=="نظاره" ? "اهرم: 2x | حد ضرر: -3% | حد سود: +9%\n" : "")
+      + reasons.map(x=>"• "+x).join("\n") + "\n\n⚠️ توصیه سرمایه‌گذاری نیست — تصمیم با خودته";
+    return { txt, side, conf, price };
+  } catch (e) {
+    return { txt: `⚠️ خطا در تحلیل ${sym}`, side: "نظاره", conf: 55, price: 0 };
+  }
+}
+
+// ---------- news ----------
+const FEEDS = ["https://www.coindesk.com/arc/outboundfeeds/rss/",
+  "https://news.google.com/rss/search?q=crypto+OR+bitcoin&hl=fa&gl=IR&ceid=IR:fa"];
+async function fetchNews(n = 6): Promise<string[]> {
+  const items: string[] = [];
+  for (const feed of FEEDS) {
+    try {
+      const xml = await (await fetch(feed)).text();
+      const titles = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/g)].map(m=>m[1]).slice(1, n+1);
+      items.push(...titles.map(t=>t.replace(/&amp;/g,"&").replace(/&#39;/g,"'").replace(/&quot;/g,'"')));
+    } catch {}
+  }
+  return items.slice(0, n);
+}
+
+// ---------- telegram ----------
+async function tg(method: string, body: any) {
+  const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
+    method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  return await r.json();
+}
+
+// ---------- handler ----------
+async function handleMessage(chatId: number, text: string) {
+  text = text.trim();
+  if (text === "/start" || text === "/help") {
+    const subs = await dbGet<number[]>("subs", memSubs);
+    if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
+    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — سیگنال‌های برتر\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+  }
+  if (text.startsWith("/price")) {
+    const parts = text.split(" ");
+    let sym = (parts[1]?.toUpperCase() ?? "BTC");
+    if (!sym.endsWith("USDT")) sym += "USDT";
+    try {
+      const p = await (await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`)).json();
+      const ch = Number(p.priceChangePercent);
+      return `${ch>=0?"🟢":"🔴"} ${sym}: ${Number(p.lastPrice).toLocaleString("en-US")}$ (${ch.toFixed(2)}% 24h)`;
+    } catch { return "⚠️ نماد پیدا نشد. مثال: /price ETH"; }
+  }
+  if (text.startsWith("/signal")) {
+    const parts = text.split(" ");
+    let sym = (parts[1]?.toUpperCase() ?? "BTCUSDT");
+    if (!sym.endsWith("USDT")) sym += "USDT";
+    const a = await analyze(sym);
+    if (a.side !== "نظاره") {
+      const sigs = await dbGet<any[]>("signals", []);
+      sigs.push({sym, side: a.side, conf: a.conf, entry: a.price, ts: Date.now(), checked: false, result: null});
+      await dbSet("signals", sigs.slice(-500));
+    }
+    return a.txt;
+  }
+  if (text === "/top") {
+    const rows: {sc:number,sym:string,p:number,r:number}[] = [];
+    for (const sym of SYMBOLS.slice(0,8)) {
+      try {
+        const closes = (await klines(sym, "1h", 100)).map(k=>Number(k[4]));
+        const r = rsi(closes); const [m, s] = macd(closes);
+        rows.push({sc:(r<35?2:r>70?-2:0)+(m>s?1:-1), sym, p: closes[closes.length-1], r});
+      } catch {}
+    }
+    rows.sort((a,b)=>b.sc-a.sc);
+    return "🔥 سیگنال‌های برتر بازار:\n" + rows.slice(0,3).map(x=>
+      `${x.sym}: ${x.sc>=2?"لانگ 🟢":x.sc<=-1?"شورت 🔴":"نظاره ⚪"} | ${x.p.toLocaleString("en-US")}$ | RSI ${x.r.toFixed(0)}`).join("\n");
+  }
+  if (text.startsWith("/news")) {
+    const parts = text.split(" ");
+    const news = await fetchNews(8);
+    if (parts[1]) {
+      const base = parts[1].toUpperCase().replace("USDT","");
+      const rel = news.filter(t=>t.toLowerCase().includes(base.toLowerCase()) || (base==="BTC"&&t.toLowerCase().includes("bitcoin")));
+      if (rel.length) return `📰 اخبار ${base}:\n\n` + rel.slice(0,5).map(t=>"🔹 "+t).join("\n\n");
+    }
+    return "📰 آخرین اخبار بازار:\n\n" + news.slice(0,6).map(t=>"🔹 "+t).join("\n\n");
+  }
+  if (text === "/stats" || text === "/states") {
+    const sigs = await dbGet<any[]>("signals", []);
+    // evaluate pending
+    let changed = false;
+    for (const s of sigs) {
+      if (s.checked || Date.now()-s.ts < 6*3600e3) continue;
+      try {
+        const p = await (await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${s.sym}`)).json();
+        let ch = (Number(p.price)/s.entry-1)*100;
+        if (s.side === "شورت") ch = -ch;
+        if (ch >= 9) s.result = "win";
+        else if (ch <= -3) s.result = "loss";
+        else if (Date.now()-s.ts > 72*3600e3) s.result = "flat";
+        if (s.result) { s.checked = true; changed = true; }
+      } catch {}
+    }
+    if (changed) await dbSet("signals", sigs);
+    const done = sigs.filter(s=>s.checked);
+    const wins = done.filter(s=>s.result==="win").length;
+    const losses = done.filter(s=>s.result==="loss").length;
+    const total = wins+losses;
+    return `📊 کارنامه واقعی سیگنال‌یار\nسیگنال‌های ارزیابی‌شده: ${total}\nموفق: ${wins} | ناموفق: ${losses}\nنرخ موفقیت: ${total?(wins/total*100).toFixed(0):0}%\n(معیار: +9% سود یا -3% ضرر حداکثر ۷۲ ساعت)\n\n⚠️ عملکرد گذشته تضمین آینده نیست`;
+  }
+  if (text === "/models") {
+    const cur = await dbGet<string>("model_" + chatId, "glm");
+    let list = "✅ /model glm — GLM (پیش‌فرض، سریع)\n";
+    if (OPENROUTER_KEY) {
+      const frees = await fetchFreeModels();
+      if (frees.length) {
+        list += frees.slice(0, 10).map((m, i) =>
+          `${("or" + (i+1)) === cur ? "✅" : "▫️"} /model or${i+1} — ${m.name}`).join("\n");
+      } else {
+        list += "⚠️ لیست مدل‌های رایگان الان در دسترس نیست";
+      }
+    } else {
+      list += "⚠️ برای مدل‌های بیشتر، کلید OpenRouter لازمه";
+    }
+    return "🧠 هوش مصنوعی‌های موجود:\n\n" + list;
+  }
+  if (text.startsWith("/model ")) {
+    const key = text.split(" ")[1]?.toLowerCase().trim();
+    if (!key) return "⚠️ مدل رو مشخص کن. لیست: /models";
+    if (key === "glm") {
+      await dbSet("model_" + chatId, "glm");
+      return "✅ برگشتی روی GLM (پیش‌فرض)";
+    }
+    if (!OPENROUTER_KEY) return "⚠️ برای مدل‌های OpenRouter اول باید کلید ست بشه.";
+    const frees = await fetchFreeModels();
+    const m = /^or(\d+)$/.exec(key ?? "");
+    const idx = m ? parseInt(m[1]) - 1 : -1;
+    if (idx < 0 || idx >= frees.length) {
+      return "⚠️ شماره نامعتبر. لیست: /models";
+    }
+    await dbSet("model_" + chatId, "or:" + frees[idx].id);
+    return `✅ هوش مصنوعی تو الان: ${frees[idx].name}`;
+  }
+  if (text === "/subscribe") {
+    const subs = await dbGet<number[]>("subs", memSubs);
+    if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
+    return "✅ فعال شد! هر ۴ ساعت بهترین سیگنال‌های خودکار رو برات می‌فرستم.";
+  }
+  if (text === "/unsubscribe") {
+    const subs = await dbGet<number[]>("subs", memSubs);
+    await dbSet("subs", subs.filter(x=>x!==chatId));
+    return "❌ لغو شد.";
+  }
+  if (text.startsWith("/")) {
+    return "🤖 این دستور رو نشناختم!\n\n/price /signal /top /news /stats /models /subscribe\n\nیا آزادانه سؤال بپرس 💬";
+  }
+  // LLM chat (per-user model selection)
+  const modelKey = await dbGet<string>("model_" + chatId, "glm");
+  const h = memChats.get(chatId) ?? [];
+  h.push({role:"user", content:text});
+  let reply: string;
+  const sysMsg = {role:"system", content:"تو سیگنال‌یار هستی، دستیار تحلیل بازار رمزارز به زبان فارسی. کوتاه، دقیق و دوستانه جواب بده. هیچ‌وقت توصیه قطعی سرمایه‌گذاری نکن و یادآوری کن تصمیم با خود کاربر است."};
+  try {
+    let j: any;
+    if (modelKey.startsWith("or:") && OPENROUTER_KEY) {
+      const r = await fetch(OR_URL, {
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":`Bearer ${OPENROUTER_KEY}`},
+        body: JSON.stringify({model: modelKey.slice(3), max_tokens:800, messages:[sysMsg, ...h.slice(-8)]})
+      });
+      j = await r.json();
+    } else {
+      const r = await fetch(LLM_URL, {
+        method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
+        body: JSON.stringify({model:"auto", max_tokens:800, messages:[sysMsg, ...h.slice(-8)]})
+      });
+      j = await r.json();
+    }
+    reply = j.choices?.[0]?.message?.content || "…";
+  } catch { reply = "⚠️ الان نمی‌تونم جواب بدم، بعداً امتحان کن."; }
+  h.push({role:"assistant", content:reply});
+  memChats.set(chatId, h.slice(-16));
+  return reply;
+}
+
+// ---------- cron: auto signals every 4h ----------
+Deno.cron("auto signals", "0 */4 * * *", async () => {
+  const subs = await dbGet<number[]>("subs", memSubs);
+  if (!subs.length) return;
+  const rows: {sc:number,sym:string,p:number}[] = [];
+  for (const sym of SYMBOLS.slice(0,8)) {
+    try {
+      const closes = (await klines(sym, "1h", 100)).map(k=>Number(k[4]));
+      const r = rsi(closes); const [m, s] = macd(closes);
+      const sc = (r<35?2:r>70?-2:0)+(m>s?1:-1);
+      if (Math.abs(sc) >= 3) rows.push({sc, sym, p: closes[closes.length-1]});
+    } catch {}
+  }
+  rows.sort((a,b)=>Math.abs(b.sc)-Math.abs(a.sc));
+  for (const row of rows.slice(0,2)) {
+    const sigs = await dbGet<any[]>("signals", []);
+    if (sigs.some(s=>s.sym===row.sym && Date.now()-s.ts < 12*3600e3)) continue;
+    const side = row.sc>=3?"لانگ":"شورت";
+    const conf = Math.min(60+Math.abs(row.sc)*7, 88);
+    const msg = `🔔 سیگنال خودکار\n${row.sym}: ${side} ${side==="لانگ"?"🟢":"🔴"}\nقیمت: ${row.p.toLocaleString("en-US")}$ | اطمینان: ${conf}%\nاهرم: 2x | حد ضرر: -3% | حد سود: +9%\n\n⚠️ توصیه سرمایه‌گذاری نیست`;
+    for (const cid of subs) {
+      try { await tg("sendMessage", {chat_id: cid, text: msg}); } catch {}
+    }
+    sigs.push({sym: row.sym, side, conf, entry: row.p, ts: Date.now(), checked: false, result: null});
+    await dbSet("signals", sigs.slice(-500));
+  }
+});
+
+// ---------- webhook server ----------
+Deno.serve(async (req: Request) => {
+  const url = new URL(req.url);
+  if (url.pathname === "/" && req.method === "GET") {
+    return new Response("SignalYar bot is running ✅");
+  }
+  if (url.pathname === "/set-webhook") {
+    const hook = `${url.origin}/webhook`;
+    const r = await tg("setWebhook", {url: hook});
+    return new Response(JSON.stringify({hook, res: r}), {status: 200});
+  }
+  if (url.pathname === "/webhook" && req.method === "POST") {
+    try {
+      const upd = await req.json();
+      const m = upd.message;
+      if (m?.chat?.id && m.text) {
+        const reply = await handleMessage(m.chat.id, m.text);
+        await tg("sendMessage", {chat_id: m.chat.id, text: reply});
+      }
+    } catch (e) { console.error(e); }
+    return new Response("ok");
+  }
+  return new Response("not found", {status: 404});
+});
