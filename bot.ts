@@ -257,12 +257,32 @@ async function handleMessage(chatId: number, text: string) {
   if (text.startsWith("/")) {
     return "🤖 این دستور رو نشناختم!\n\n/price /signal /top /news /stats /models /subscribe\n\nیا آزادانه سؤال بپرس 💬";
   }
-  // LLM chat (per-user model selection)
+  // LLM chat (per-user model selection) — AI as "bot manager": feeds real market data into context
   const modelKey = await dbGet<string>("model_" + chatId, "glm");
   const h = memChats.get(chatId) ?? [];
   h.push({role:"user", content:text});
   let reply: string;
-  const sysMsg = {role:"system", content:"تو سیگنال‌یار هستی، دستیار تحلیل بازار رمزارز به زبان فارسی. کوتاه، دقیق و دوستانه جواب بده. هیچ‌وقت توصیه قطعی سرمایه‌گذاری نکن و یادآوری کن تصمیم با خود کاربر است."};
+  // gather real-time data context (only when the message looks market-related, to stay fast)
+  let marketCtx = "";
+  const wantsMarket = /btc|بیت|اتریوم|eth|sol|ریپل|xrp|دوج|doge|ada|bnb|avax|link|dot|کریپتو|رمزارز|بازار|قیمت|سیگنال|بخرم|بفروشم|تحلیل|سود|ضرر|لانگ|شورت/i.test(text);
+  if (wantsMarket) {
+    try {
+      const parts: string[] = [];
+      const top = SYMBOLS.slice(0, 6);
+      for (const sym of top) {
+        try {
+          const closes = (await klines(sym, "1h", 100)).map(k=>Number(k[4]));
+          const p = closes[closes.length-1];
+          const r = rsi(closes);
+          const [m, s] = macd(closes);
+          const chg = ((p / closes[closes.length-25] - 1) * 100);
+          parts.push(`${sym.replace("USDT","")}: قیمت=${p.toLocaleString("en-US")}$، RSI=${r.toFixed(0)}، MACD=${m>s?"مثبت (صعودی)":"منفی (نزولی)"}، تغییر ۲۴ساعت=${chg.toFixed(1)}%`);
+        } catch {}
+      }
+      if (parts.length) marketCtx = "\n\n[داده‌های لحظه‌ای بازار (محاسبه‌شده واقعی از Binance — این اعداد حقیقی‌اند):\n" + parts.join("\n") + "]";
+    } catch {}
+  }
+  const sysMsg = {role:"system", content:"تو سیگنال‌یار هستی، مدیر تحلیل‌گر بازار رمزارز به زبان فارسی. اگر داده لحظه‌ای بازار در پیام بهت داده شده، بر اساس همان اعداد واقعی تحلیل کن و به آن‌ها ارجاع بده؛ حدس نزن. کوتاه، دقیق و دوستانه جواب بده. هیچ‌وقت توصیه قطعی سرمایه‌گذاری نکن و یادآوری کن تصمیم با خود کاربر است." + marketCtx};
   try {
     let j: any;
     console.log(`[chat] user=${chatId} modelKey=${modelKey}`);
