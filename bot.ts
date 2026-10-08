@@ -17,6 +17,17 @@ async function fetchFreeModels(): Promise<{id: string, name: string}[]> {
   } catch { return []; }
 }
 const SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","DOTUSDT"];
+// broad scan: top USDT pairs by 24h quote volume (fresh listings naturally enter as volume grows)
+async function topSymbols(n = 25): Promise<string[]> {
+  try {
+    const j = await (await fetch("https://data-api.binance.vision/api/v3/ticker/24hr")).json();
+    return (Array.isArray(j) ? j : [])
+      .filter((t: any) => typeof t.symbol === "string" && t.symbol.endsWith("USDT") && !/(UP|DOWN|BULL|BEAR)USDT$/.test(t.symbol))
+      .sort((a: any, b: any) => Number(b.quoteVolume) - Number(a.quoteVolume))
+      .slice(0, n)
+      .map((t: any) => t.symbol);
+  } catch { return SYMBOLS; }
+}
 
 // ---------- persistence (Deno KV) ----------
 let kv: any = null;
@@ -203,13 +214,38 @@ async function tg(method: string, body: any) {
   return await r.json();
 }
 
+// ---------- shared market scoring (used by /rank and cron) ----------
+async function rankScan(syms: string[]): Promise<{sym:string,p:number,sc:number,rsi:number}[]> {
+  const out: {sym:string,p:number,sc:number,rsi:number}[] = [];
+  for (const sym of syms) {
+    try {
+      const ks = await klines(sym, "1h", 100);
+      const closes = ks.map(k=>Number(k[4]));
+      const r = rsi(closes);
+      const [m, s] = macd(closes);
+      const bb = bollinger(closes);
+      const sr = srLevels(closes);
+      let sc = 0;
+      sc += r < 35 ? 2 : r > 70 ? -2 : 0;
+      sc += m > s ? 1 : -1;
+      if (bb.pos <= 0.15) sc += 1; else if (bb.pos >= 0.85) sc -= 1;
+      const mid = (sr.sup + sr.res) / 2;
+      const p = closes[closes.length-1];
+      sc += p > mid ? 1 : -1;
+      out.push({sym, p, sc, rsi: r});
+    } catch {}
+  }
+  out.sort((a,b) => b.sc - a.sc);
+  return out;
+}
+
 // ---------- handler ----------
 async function handleMessage(chatId: number, text: string) {
   text = text.trim();
   if (text === "/start" || text === "/help") {
     const subs = await dbGet<number[]>("subs", memSubs);
     if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
-    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — سیگنال‌های برتر\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز (قوی→ضعیف)\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
   }
   if (text.startsWith("/price")) {
     const parts = text.split(" ");
@@ -232,6 +268,18 @@ async function handleMessage(chatId: number, text: string) {
       await dbSet("signals", sigs.slice(-500));
     }
     return a.txt;
+  }
+  if (text === "/rank" || text === "/ranking") {
+    // full market ranking: strong → weak across top-25 by volume (includes fresh listings)
+    const syms = await topSymbols(25);
+    const results = await rankScan(syms);
+    if (!results.length) return "⚠️ الان اسکن ممکن نبود، بعداً امتحان کن.";
+    const lines = results.map((x, i) => {
+      const tag = x.sc >= 4 ? "قوی 🟢" : x.sc >= 2 ? "مثبت 🟢" : x.sc <= -4 ? "قوی 🔴" : x.sc <= -2 ? "منفی 🔴" : "خنثی ⚪";
+      return `${(i+1).toString().padStart(2)} | ${x.sym.replace("USDT","").padEnd(6)} | ${x.p.toLocaleString("en-US")}$ | امتیاز ${x.sc>=0?"+":""}${x.sc} ${tag} | RSI ${x.rsi.toFixed(0)}`;
+    });
+    return `🏆 رتبه‌بندی بازار (۲۵ ارز برتر از نظر حجم)\nقوی → ضعیف:\n\n` + lines.join("\n")
+      + `\n\n📏 امتیاز از +۶ (بسیار صعودی) تا -۶ (بسیار نزولی) — ترکیب RSI، MACD، بولینگر و ساختار بازار\n\n⚠️ توصیه سرمایه‌گذاری نیست`;
   }
   if (text === "/top") {
     const rows: {sc:number,sym:string,p:number,r:number}[] = [];
@@ -332,7 +380,7 @@ async function handleMessage(chatId: number, text: string) {
     return "❌ لغو شد.";
   }
   if (text.startsWith("/")) {
-    return "🤖 این دستور رو نشناختم!\n\n/price /signal /top /news /stats /models /subscribe\n\nیا آزادانه سؤال بپرس 💬";
+    return "🤖 این دستور رو نشناختم!\n\n/price /signal /top /rank /news /stats /models /subscribe\n\nیا آزادانه سؤال بپرس 💬";
   }
   // LLM chat (per-user model selection) — AI as "bot manager": feeds real market data into context
   const modelKey = await dbGet<string>("model_" + chatId, "glm");
@@ -412,15 +460,16 @@ async function handleMessage(chatId: number, text: string) {
 Deno.cron("auto signals", "0 */4 * * *", async () => {
   const subs = await dbGet<number[]>("subs", memSubs);
   if (!subs.length) return;
+  // scan top-25 by volume (fresh listings included automatically)
+  const syms = await topSymbols(25);
   const rows: {sc:number,sym:string,p:number,at:number}[] = [];
-  for (const sym of SYMBOLS.slice(0,8)) {
+  for (const sym of syms) {
     try {
       const ks = await klines(sym, "1h", 100);
       const closes = ks.map(k=>Number(k[4]));
       const r = rsi(closes); const [m, s] = macd(closes);
       const bb = bollinger(closes);
       const sr = srLevels(closes);
-      const fb = fib(closes);
       // strict multi-factor score: RSI + MACD + Bollinger edge + trend alignment
       let sc = 0;
       sc += r < 35 ? 2 : r > 70 ? -2 : 0;             // RSI extremes
@@ -436,6 +485,7 @@ Deno.cron("auto signals", "0 */4 * * *", async () => {
       if (Math.abs(sc) >= 4 && strongConfluence) rows.push({sc, sym, p, at: atr(ks)});
     } catch {}
   }
+  // prefer strongest; skip coins with tiny 1h volume (illiquid pumps)
   rows.sort((a,b)=>Math.abs(b.sc)-Math.abs(a.sc));
   const fmt = (v:number, d=2) => v >= 1000 ? v.toLocaleString("en-US",{maximumFractionDigits:0}) : v >= 1 ? v.toLocaleString("en-US",{maximumFractionDigits:d}) : v.toLocaleString("en-US",{maximumFractionDigits:4});
   for (const row of rows.slice(0,2)) {
