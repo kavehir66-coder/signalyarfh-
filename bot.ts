@@ -39,8 +39,20 @@ async function dbSet(key: string, val: unknown) {
 
 // ---------- TA ----------
 async function klines(sym: string, interval = "1h", limit = 200): Promise<number[][]> {
-  const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
-  return await r.json();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      // data-api.binance.vision: public market-data mirror, no geo-restriction (api.binance.com blocks some datacenter IPs)
+      const r = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
+      const j = await r.json();
+      if (Array.isArray(j) && j.length) return j;
+      // Binance error object (e.g. rate limit) — wait and retry
+      console.log(`[klines] ${sym} bad response: ${JSON.stringify(j).slice(0, 120)}`);
+    } catch (e) {
+      console.log(`[klines] ${sym} fetch err: ${e instanceof Error ? e.message : e}`);
+    }
+    await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
+  }
+  throw new Error(`klines unavailable for ${sym}`);
 }
 function rsi(closes: number[], period = 14): number {
   const gains: number[] = [], losses: number[] = [];
@@ -137,10 +149,11 @@ async function analyze(sym: string) {
     else if (bb.pos >= 0.85) { score -= 1; reasons.push(`قیمت نزدیک باند بالای بولینگر (${bb.up.toLocaleString("en-US")}$)`); }
     if (volRatio > 1.5) reasons.push(`حجم بالا (${volRatio.toFixed(1)}x)`);
     reasons.push((ch24>0?"رشد ":"افت ") + `۲۴ساعته ${ch24.toFixed(1)}%`);
-    reasons.push(`ATR (نوسان): ${at.toLocaleString("en-US", {maximumFractionDigits: 1})}$ — حد ضرر منطقی ≈ ${(price-2*at).toLocaleString("en-US",{maximumFractionDigits:0})}$`);
-    reasons.push(`حمایت: ${sr.sup.toLocaleString("en-US")}$ | مقاومت: ${sr.res.toLocaleString("en-US")}$`);
+    const fmt = (v:number, d=2) => v >= 1000 ? v.toLocaleString("en-US",{maximumFractionDigits:0}) : v.toLocaleString("en-US",{maximumFractionDigits:d});
+    reasons.push(`ATR (نوسان): ${fmt(at,4)}$ — حد ضرر منطقی ≈ ${fmt(price-2*at,4)}$`);
+    reasons.push(`حمایت: ${fmt(sr.sup)}$ | مقاومت: ${fmt(sr.res)}$`);
     const fbKey = fb.pos < 0.3 ? "نزدیک ۲۳.۶٪" : fb.pos < 0.45 ? "نزدیک ۳۸.۲٪" : fb.pos < 0.55 ? "نزدیک ۵۰٪" : fb.pos < 0.7 ? "نزدیک ۶۱.۸٪" : "بالای ۶۱.۸٪";
-    reasons.push(`فیبوناچی: ${fbKey} بازه سقف/کف ۵ روز اخیر (سقف ${fb.levels["hi"].toLocaleString("en-US")}$ / کف ${fb.levels["lo"].toLocaleString("en-US")}$)`);
+    reasons.push(`فیبوناچی: ${fbKey} بازه سقف/کف ۵ روز اخیر (سقف ${fmt(fb.levels["hi"])}$ / کف ${fmt(fb.levels["lo"])}$)`);
     let side = "نظاره", conf = 55;
     if (score >= 2) { side = "لانگ"; conf = Math.min(60+score*7, 88); }
     else if (score <= -2) { side = "شورت"; conf = Math.min(60+Math.abs(score)*7, 88); }
@@ -148,8 +161,10 @@ async function analyze(sym: string) {
     const txt = `📈 تحلیل ${sym}\nقیمت: ${price.toLocaleString("en-US")}$\nسمت پیشنهادی: ${side} ${emoji}\nاطمینان: ${conf}%\n`
       + (side!=="نظاره" ? "اهرم: 2x | حد ضرر: -3% | حد سود: +9%\n" : "")
       + reasons.map(x=>"• "+x).join("\n") + "\n\n⚠️ توصیه سرمایه‌گذاری نیست — تصمیم با خودته";
+    console.log(`[analyze] ${sym} reasons=${reasons.length} txtlen=${txt.length} detail=${JSON.stringify(reasons).slice(0,500)}`);
     return { txt, side, conf, price };
   } catch (e) {
+    console.log(`[analyze] ERR ${sym}: ${e instanceof Error ? e.message : String(e)}`);
     return { txt: `⚠️ خطا در تحلیل ${sym}`, side: "نظاره", conf: 55, price: 0 };
   }
 }
@@ -189,7 +204,7 @@ async function handleMessage(chatId: number, text: string) {
     let sym = (parts[1]?.toUpperCase() ?? "BTC");
     if (!sym.endsWith("USDT")) sym += "USDT";
     try {
-      const p = await (await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`)).json();
+      const p = await (await fetch(`https://data-api.binance.vision/api/v3/ticker/24hr?symbol=${sym}`)).json();
       const ch = Number(p.priceChangePercent);
       return `${ch>=0?"🟢":"🔴"} ${sym}: ${Number(p.lastPrice).toLocaleString("en-US")}$ (${ch.toFixed(2)}% 24h)`;
     } catch { return "⚠️ نماد پیدا نشد. مثال: /price ETH"; }
@@ -236,7 +251,7 @@ async function handleMessage(chatId: number, text: string) {
     for (const s of sigs) {
       if (s.checked || Date.now()-s.ts < 6*3600e3) continue;
       try {
-        const p = await (await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${s.sym}`)).json();
+        const p = await (await fetch(`https://data-api.binance.vision/api/v3/ticker/price?symbol=${s.sym}`)).json();
         let ch = (Number(p.price)/s.entry-1)*100;
         if (s.side === "شورت") ch = -ch;
         if (ch >= 9) s.result = "win";
@@ -423,8 +438,7 @@ Deno.serve(async (req: Request) => {
       if (m?.chat?.id && m.text) {
         const reply = await handleMessage(m.chat.id, m.text);
         const sr = await tg("sendMessage", {chat_id: m.chat.id, text: reply});
-        if (!sr.ok) console.log(`[send] FAIL chat=${m.chat.id} err=${JSON.stringify(sr.description ?? sr)}`);
-        else console.log(`[send] ok chat=${m.chat.id} len=${reply.length}`);
+        console.log(`[send] ${sr.ok?"ok":"FAIL"} chat=${m.chat.id} len=${reply.length} head=${JSON.stringify(reply.slice(0,120))}`);
       }
     } catch (e) { console.error(e); }
     return new Response("ok");
