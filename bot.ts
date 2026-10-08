@@ -161,8 +161,7 @@ async function analyze(sym: string) {
     const txt = `📈 تحلیل ${sym}\nقیمت: ${price.toLocaleString("en-US")}$\nسمت پیشنهادی: ${side} ${emoji}\nاطمینان: ${conf}%\n`
       + (side!=="نظاره" ? "اهرم: 2x | حد ضرر: -3% | حد سود: +9%\n" : "")
       + reasons.map(x=>"• "+x).join("\n") + "\n\n⚠️ توصیه سرمایه‌گذاری نیست — تصمیم با خودته";
-    console.log(`[analyze] ${sym} reasons=${reasons.length} txtlen=${txt.length} detail=${JSON.stringify(reasons).slice(0,500)}`);
-    return { txt, side, conf, price };
+        return { txt, side, conf, price };
   } catch (e) {
     console.log(`[analyze] ERR ${sym}: ${e instanceof Error ? e.message : String(e)}`);
     return { txt: `⚠️ خطا در تحلیل ${sym}`, side: "نظاره", conf: 55, price: 0 };
