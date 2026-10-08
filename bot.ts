@@ -418,8 +418,22 @@ Deno.cron("auto signals", "0 */4 * * *", async () => {
       const ks = await klines(sym, "1h", 100);
       const closes = ks.map(k=>Number(k[4]));
       const r = rsi(closes); const [m, s] = macd(closes);
-      const sc = (r<35?2:r>70?-2:0)+(m>s?1:-1);
-      if (Math.abs(sc) >= 3) rows.push({sc, sym, p: closes[closes.length-1], at: atr(ks)});
+      const bb = bollinger(closes);
+      const sr = srLevels(closes);
+      const fb = fib(closes);
+      // strict multi-factor score: RSI + MACD + Bollinger edge + trend alignment
+      let sc = 0;
+      sc += r < 35 ? 2 : r > 70 ? -2 : 0;             // RSI extremes
+      sc += m > s ? 1 : -1;                            // MACD direction
+      if (bb.pos <= 0.15) sc += 1;                     // at lower Bollinger band (bounce zone)
+      else if (bb.pos >= 0.85) sc -= 1;                // at upper band (exhaustion zone)
+      // trend alignment: price above support & below resistance midpoint = structurally long
+      const mid = (sr.sup + sr.res) / 2;
+      const p = closes[closes.length-1];
+      if (p > mid) sc += 1; else sc -= 1;              // structure bias
+      // quality gate: require ≥4 AND confluence (RSI extreme OR bollinger edge, plus MACD agreeing)
+      const strongConfluence = (Math.abs(r - 50) > 15 || bb.pos <= 0.15 || bb.pos >= 0.85) && ((m > s) === (sc > 0));
+      if (Math.abs(sc) >= 4 && strongConfluence) rows.push({sc, sym, p, at: atr(ks)});
     } catch {}
   }
   rows.sort((a,b)=>Math.abs(b.sc)-Math.abs(a.sc));
@@ -427,8 +441,9 @@ Deno.cron("auto signals", "0 */4 * * *", async () => {
   for (const row of rows.slice(0,2)) {
     const sigs = await dbGet<any[]>("signals", []);
     if (sigs.some(s=>s.sym===row.sym && Date.now()-s.ts < 12*3600e3)) continue;
-    const side = row.sc>=3?"لانگ":"شورت";
-    const conf = Math.min(60+Math.abs(row.sc)*7, 88);
+    const side = row.sc>=0?"لانگ":"شورت";
+    // realistic confidence: 55 base + score bonus, capped lower than before
+    const conf = Math.min(55 + Math.abs(row.sc)*5, 82);
     // dynamic risk from ATR (same formula as /signal)
     const slPct = (2*row.at/row.p)*100, tpPct = (3*row.at/row.p)*100;
     const volFactor = 2*row.at/row.p;
