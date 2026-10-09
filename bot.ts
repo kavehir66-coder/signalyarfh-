@@ -266,7 +266,7 @@ async function handleMessage(chatId: number, text: string) {
   if (text === "/start" || text === "/help") {
     const subs = await dbGet<number[]>("subs", memSubs);
     if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
-    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز (قوی→ضعیف)\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز (قوی→ضعیف)\n/trend — نبض شبکه‌های اجتماعی و ترندها\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
   }
   if (text.startsWith("/price")) {
     const parts = text.split(" ");
@@ -328,6 +328,56 @@ async function handleMessage(chatId: number, text: string) {
     }
     const raw = "📰 آخرین اخبار بازار:\n\n" + news.slice(0,6).map(t=>"🔹 "+t).join("\n\n");
     return await newsDigest(news.slice(0,6), "آخرین اخبار بازار رمزارز") ?? raw;
+  }
+  if (text === "/trend" || text.startsWith("/trend ")) {
+    // social/trend pulse: where the money & attention is going
+    const parts: string[] = [];
+    let fngLine = "";
+    try {
+      const f = await (await fetch("https://api.alternative.me/fng/?limit=1")).json();
+      const d = f.data?.[0];
+      if (d) {
+        const v = Number(d.value);
+        const emoji = v <= 25 ? "😱 ترس شدید" : v <= 45 ? "😰 ترس" : v <= 55 ? "😐 خنثی" : v <= 75 ? "🤑 طمع" : "🔥 طمع شدید";
+        fngLine = `\n🎭 شاخص ترس و طمع: ${v}/100 (${emoji})`;
+      }
+    } catch {}
+    try {
+      const t = await (await fetch("https://api.coingecko.com/api/v3/search/trending")).json();
+      const hot = (t.coins||[]).slice(0,6).map((c:any)=>c.item).filter(Boolean);
+      if (hot.length) {
+        parts.push("🔥 داغ‌ترین ارزهای شبکه‌های اجتماعی (جستجوی کاربران):");
+        parts.push(hot.map((c:any)=>`• ${c.symbol} ${c.market_cap_rank?`(رتبه بازار #${c.market_cap_rank})`:"(تازه‌وارد)"}`).join("\n"));
+      }
+    } catch {}
+    try {
+      const j = await (await fetch("https://data-api.binance.vision/api/v3/ticker/24hr")).json();
+      const usdt = (Array.isArray(j)?j:[]).filter((t:any)=>typeof t.symbol==="string" && t.symbol.endsWith("USDT") && Number(t.quoteVolume)>5e6 && !/(UP|DOWN|BULL|BEAR)USDT$/.test(t.symbol));
+      const g = [...usdt].sort((a:any,b:any)=>Number(b.priceChangePercent)-Number(a.priceChangePercent)).slice(0,5);
+      const l = [...usdt].sort((a:any,b:any)=>Number(a.priceChangePercent)-Number(b.priceChangePercent)).slice(0,5);
+      parts.push("📈 پامپ‌های ۲۴ ساعت اخیر (موج اجتماعی/پول وارد شده):");
+      parts.push(g.map((t:any)=>`• ${t.symbol.replace("USDT","")} +${Number(t.priceChangePercent).toFixed(1)}% (حجم ${Number(t.quoteVolume).toLocaleString("en-US",{notation:"compact"})}$)`).join("\n"));
+      parts.push("📉 دامپ‌های ۲۴ ساعت اخیر:");
+      parts.push(l.map((t:any)=>`• ${t.symbol.replace("USDT","")} ${Number(t.priceChangePercent).toFixed(1)}%`).join("\n"));
+      // accumulation vs distribution proxy: up-movers vs down-movers count on high-volume pairs
+      const ups = usdt.filter((t:any)=>Number(t.priceChangePercent)>0).length;
+      parts.push(`⚖️ عرض و تقاضا: از ${usdt.length} ارز پرحجم، ${ups} تا سبز و ${usdt.length-ups} تا قرمز (${ups>usdt.length-ups?"فشار خرید غالب":"فشار فروش غالب"})`);
+    } catch {}
+    if (!parts.length) return "⚠️ الان داده ترند در دسترس نیست، بعداً امتحان کن.";
+    let out = `🌊 نبض بازار و شبکه‌های اجتماعی\n${fngLine}\n\n` + parts.join("\n\n");
+    // AI interpretation on top of real data
+    try {
+      const r = await fetch(LLM_URL, {
+        method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
+        body: JSON.stringify({model:"auto", max_tokens:2000, messages:[
+          {role:"system", content:"تو تحلیلگر احساسات بازار رمزارز هستی، فارسی روان و کوتاه."},
+          {role:"user", content:`بر اساس این داده‌های واقعی (رتبه‌بندی جستجوی اجتماعی، پامپ/دامپ‌های ۲۴ساعته، شاخص ترس و طمع) ۴-۵ خط جمع‌بندی کن: پول و توجه کاربران به کدام ارزها/حوزه‌ها در حال رفتنه، چه ریسک‌هایی دیده می‌شود (مثلاً پامپ‌های بی‌پشتوانه) و حس کلی بازار چیه. اعداد را نقض نکن، فقط تفسیر کن:\n\n${parts.join("\n")}`}]})
+      });
+      const j = await r.json();
+      const ai = (j.choices?.[0]?.message?.content || "").trim();
+      if (ai) out += "\n\n🧠 جمع‌بندی تحلیل‌گر:\n" + ai;
+    } catch {}
+    return out + "\n\n⚠️ توصیه سرمایه‌گذاری نیست — تصمیم با خودته";
   }
   if (text === "/stats" || text === "/states") {
     const sigs = await dbGet<any[]>("signals", []);
