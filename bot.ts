@@ -146,6 +146,49 @@ function fib(closes: number[], lookback = 120) {
   const pos = d===0 ? 0.5 : (p-lo)/d;
   return {levels, pos};
 }
+// detect classic candlestick patterns from the last 3 candles (OHLC)
+function candlePatterns(ks: number[][]): string[] {
+  const out: string[] = [];
+  const k = (i: number) => ({o: Number(ks[i][1]), h: Number(ks[i][2]), l: Number(ks[i][3]), c: Number(ks[i][4])});
+  if (ks.length < 3) return out;
+  const c = k(ks.length-1), p = k(ks.length-2), pp = k(ks.length-3);
+  const body = (x: ReturnType<typeof k>) => Math.abs(x.c - x.o);
+  const range = (x: ReturnType<typeof k>) => x.h - x.l || 1e-9;
+  const upper = (x: ReturnType<typeof k>) => x.h - Math.max(x.o, x.c);
+  const lower = (x: ReturnType<typeof k>) => Math.min(x.o, x.c) - x.l;
+  const green = (x: ReturnType<typeof k>) => x.c > x.o;
+  // Doji: tiny body vs long wicks
+  if (body(c) / range(c) < 0.12) out.push("دوجی ⚪ (تردید بازار)");
+  // Hammer / Shooting star
+  if (lower(c) > body(c)*2 && upper(c) < body(c) && green(c)) out.push("چکش 🟢 (برگشت صعودی احتمالی)");
+  if (upper(c) > body(c)*2 && lower(c) < body(c) && !green(c)) out.push("ستاره ثابت 🔴 (برگشت نزولی احتمالی)");
+  // Engulfing
+  if (green(c) && !green(p) && c.c > p.o && c.o < p.c) out.push("پوشای صعودی 🟢 (خریداران قوی)");
+  if (!green(c) && green(p) && c.c < p.o && c.o > p.c) out.push("پوشای نزولی 🔴 (فروشندگان قوی)");
+  // Morning/Evening star (3-candle)
+  if (!green(pp) && body(p)/range(p) < 0.3 && green(c) && c.c > (pp.o+pp.c)/2) out.push("ستاره صبحگاهی 🟢 (برگشت صعودی)");
+  if (green(pp) && body(p)/range(p) < 0.3 && !green(c) && c.c < (pp.o+pp.c)/2) out.push("ستاره شبانه 🔴 (برگشت نزولی)");
+  // Marubozu: full body, tiny wicks — strong momentum
+  if (body(c)/range(c) > 0.85) out.push(green(c) ? "مارابوزو سبز 🟢 (مومنتوم قوی)" : "مارابوزو قرمز 🔴 (مومنتوم نزولی)");
+  return out;
+}
+// trend classification from swing highs/lows + EMA slope
+function trendInfo(closes: number[]): {dir:string, desc:string} {
+  if (closes.length < 60) return {dir: "خنثی", desc: "داده کافی نیست"};
+  // higher-highs/lower-lows over 3 windows
+  const w = Math.floor(closes.length/3);
+  const [a, b, c] = [closes.slice(0,w), closes.slice(w,2*w), closes.slice(2*w)];
+  const hh = Math.max(...b) > Math.max(...a) && Math.max(...c) > Math.max(...b);
+  const ll = Math.min(...b) < Math.min(...a) && Math.min(...c) < Math.min(...b);
+  const e50 = ema(closes, 50), e20 = ema(closes, 20);
+  const p = closes[closes.length-1];
+  let dir = "خنثی (رنج)", desc = "قیمت در محدوده افقی حرکت می‌کنه";
+  if (hh && p > e20 && e20 > e50) { dir = "صعودی 📈"; desc = "سقف‌ها و کف‌های بالاتر + قیمت بالای مووینگ‌ها"; }
+  else if (ll && p < e20 && e20 < e50) { dir = "نزولی 📉"; desc = "سقف‌ها و کف‌های پایین‌تر + قیمت زیر مووینگ‌ها"; }
+  else if (p > e50) { dir = "صعودی ضعیف"; desc = "بالاتر از مووینگ ۵۰ ولی ساختار کامل صعودی نیست"; }
+  else { dir = "نزولی ضعیف"; desc = "پایین‌تر از مووینگ ۵۰ ولی ساختار کامل نزولی نیست"; }
+  return {dir, desc};
+}
 
 // ---------- analysis ----------
 async function analyze(sym: string) {
@@ -278,7 +321,199 @@ async function handleMessage(chatId: number, text: string) {
   if (text === "/start" || text === "/help") {
     const subs = await dbGet<number[]>("subs", memSubs);
     if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
-    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز (قوی→ضعیف)\n/brief — جمع‌بندی روزانه و بهترین گزینه‌ها\n/trend — نبض شبکه‌های اجتماعی و ترندها\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+    return "👋 سلام! من سیگنال‌یارم 🤖\n\n📊 تحلیل:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال کامل\n/chart — کندل‌شناسی + روند + الگو + فاندینگ\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز\n/brief — جمع‌بندی روزانه\n/trend — نبض شبکه‌های اجتماعی\n/news — اخبار بازار\n/stats — کارنامه واقعی\n\n🎓 آموزش (آکادمی):\n/learn — فهرست درس‌ها (۸ درس)\n/learn 1 تا 8 — متن درس\n/calc — ماشین‌حساب مدیریت سرمایه\n\n⚙️ تنظیمات:\n/models — هوش مصنوعی\n/subscribe — سیگنال خودکار\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+  }
+  // ---------- trading academy ----------
+  if (text.startsWith("/learn")) {
+    const LESSONS = [
+      {t:"کندل‌شناسی", body:`🕯 درس ۱ — کندل‌شناسی
+
+هر کندل داستان یه دوره معاملاتی رو می‌گه:
+• بدنه (بدن سبز/قرمز): فاصله باز شدن تا بسته شدن
+• سایه بالا: سقفی که خریدها رد شد
+• سایه پایین: کفی که خرید اومد
+
+کلمات کلیدی:
+▪️ بدنه بلند = تصمیم قطعی بازار
+▪️ بدنه کوتاه + سایه‌های بلند (دوجی) = تردید، احتمال برگشت
+▪️ سایه پایین بلند = خریداران قیمت رو بالا کشیدن (تقاضا)
+▪️ سایه بالا بلند = فروشندگان فشار اوردن (عرضه)
+
+قانون طلایی: هیچ‌وقت به یک کندل تنها اکتفا نکن — همیشه ۲-۳ کندل آخر رو با هم تفسیر کن و صبر کن کندل بسته بشه.
+
+تمرین: /chart BTC بزن و الگوی کندل آخر رو با این درس تطبیق بده.`},
+      {t:"روندشناسی", body:`📈 درس ۲ — روندشناسی
+
+روند = جهت غالب حرکت. «روند دوست توئه» — همیشه جهت بازار رو اول پیدا کن.
+
+سه نوع روند:
+📈 صعودی: سقف بالاتر (HH) + کف بالاتر (HL)
+📉 نزولی: سقف پایین‌تر (LH) + کف پایین‌تر (LL)
+➡️ رنج: قیمت بین حمایت و مقاومت افقی
+
+قوانین:
+۱. در روند صعودی فقط به دنبال خرید بگرد، در نزولی فقط فروش (Counter-trend = ریسک بالا)
+۲. مووینگ اورج (EMA 20 و 50): قیمت بالاشون = فضا خریداران، زیرشون = فروشندگان
+۳. روند در تایم‌فریم بزرگ (۴h/1d) مهم‌تر از تایم کوچیکه — اول چارت روزانه، بعد ورود در ۱h
+
+تمرین: /chart BTC بزن و ببین بات چه روندی شناسایی کرده.`},
+      {t:"حمایت و مقاومت", body:`🧱 درس ۳ — حمایت و مقاومت
+
+حمایت (Support): کف‌ای که قیمت بهش می‌خوره و برمی‌گرده (خریداران اونجاست)
+مقاومت (Resistance): سقفی که قیمت بهش می‌خوره و رد می‌شه (فروشندگان اونجاست)
+
+نکات حرفه‌ای:
+۱. هرچقدر یک سطح بیشتر تست شده باشه، قوی‌تره — ولی هر تست، سطح رو ضعیف‌تر می‌کنه (نیروها مصرف می‌شن)
+۲. حمایت بعد از شکست، نقشش برعکس می‌شه (مقاومت جدید) و برعکس — به این می‌گن تغییر نقش
+۳. سطوح «منطقه» هستن نه خط دقیق — یه محدوده بگیر نه یه قیمت
+۴. فیبوناچی (61.8%) و مووینگ‌ها هم نقش S/R دارن
+
+ورود حرفه‌ای: صبر کن قیمت به S/R برسه، کندل برگشتی ببین (چکش/پوشا)، بعد وارد شو. خرید وسط هیچ‌جا = بدترین نقطه.
+
+تمرین: /chart ETH بزن و حمایت/مقاومت فعلی رو ببین.`},
+      {t:"الگوهای کلاسیک", body:`📐 درس ۴ — الگوهای کلاسیک (چارت و کندل)
+
+الگوهای برگشتی (تغییر جهت):
+▪️ سر و شانه (Head & Shoulders): اوج، اوج بالاتر، اوج پایین‌تر = نزول پیش رو
+▪️ سقف دوگانه (Double Top): دو تست ناموفق مقاومت = نزول
+▪️ کف دوگانه (Double Bottom): دو تست ناموفق حمایت = صعود
+
+الگوهای ادامه‌دهنده (استراحت، بعد ادامه روند):
+▪️ پرچم (Flag): کانال کوچک مخالف روند → ادامه روند
+▪️ مثلث (Triangle): فشرده شدن قیمت → شکست در جهت روند قبلی
+
+الگوهای کندلی (که بات خودکار شناسایی می‌کنه):
+دوجی، چکش، ستاره ثابت، پوشای صعودی/نزولی، ستاره صبحگاهی/شبانه، مارابوزو
+
+قانون مهم: الگو بدون حجم معتبر نیست! شکست با حجم بالا = واقعی؛ شکست با حجم کم = احتمالاً فیک.
+
+تمرین: /chart BTC بزن — بات الگوهای کندلی لحظه رو تشخیص می‌ده.`},
+      {t:"اندیکاتورها", body:`📊 درس ۵ — اندیکاتورها
+
+ اندیکاتورها ۲ دسته‌ان: مومنتوم و روندی.
+
+RSI (0-100):
+• زیر ۳۰ = اشباع فروش (احتمال برگشت صعودی)
+• بالای ۷۰ = اشباع خرید (احتمال اصلاح)
+• واگرایی: قیمت سقف جدید می‌زنه ولی RSI نه = هشدار برگشت ⚠️
+
+MACD:
+• خط MACD بالای سیگنال = مومنتوم صعودی
+• کراس زیر صفر → صعود معکوس = تغییر روند قوی
+
+بولینگر باند:
+• قیمت به باند پایین بخوره = ارزون‌تر از میانگین (در رنج، خرید)
+• در روند قوی، قیمت «دویدن» روی باند می‌مونه — بلافاصله خرید نکن!
+
+ATR: نوسان واقعی بازار رو می‌سنجه — پایه‌ی حد ضرر حرفه‌ای (که بات برات حساب می‌کنه).
+
+قانون: اندیکاتور تأییدکننده‌ست نه پیشگو. اول ساختار چارت (درس ۲و۳)، بعد اندیکاتور.
+
+تمرین: /signal BTC همه این‌ها رو با هم نشون می‌ده.`},
+      {t:"مدیریت سرمایه", body:`💰 درس ۶ — مدیریت سرمایه (مهم‌ترین درس!)
+
+۹۰٪ تریدرها به خاطر ضعف مدیریت سرمایه می‌بازن، نه تحلیل بد.
+
+قوانین حیاتی:
+۱. ریسک هر معامله: فقط ۱-۲٪ کل سرمایه (نه بیشتر!)
+۲. نسبت سود به ضرر (R/R): حداقل 1:1.5 — یعنی اگه حد ضررت ۲٪، حد سود حداقل ۳٪
+۳. اهرم: برای شروع ۲-۳x کافیه. اهرم بالا = مرگ سریع. بات بر اساس نوسان (ATR) اهرم پیشنهادی می‌ده
+۴. حد ضرر رو هرگز جابه‌جا نکن! فقط به سود انتقالش بده (تریلینگ)
+۵. بعد از ۲ باخت پشت هم، متوقف شو — احساسات و انتقام‌جویی = نابودی حساب
+۶. اندازه پوزیشن = (سرمایه × ریسک٪) ÷ فاصله تا حد ضرر
+
+مثال: ۱۰۰۰$ داری، ریسک ۱٪ = ۱۰$، فاصله SL = ۵٪ → پوزیشن = ۱۰ ÷ ۰.۰۵ = ۲۰۰$
+
+ابزار: /calc بزن — ماشین‌حساب مدیریت سرمایه خودکار.`},
+      {t:"روانشناسی ترید", body:`🧠 درس ۷ — روانشناسی ترید
+
+بزرگ‌ترین دشمنت خودتی، نه بازار!
+
+۴ هیولای روانی:
+1️⃣ ترس (FOMO): «دیر نشم از دستم میره» → ورود در سقف. راه‌حل: برنامه قبل از معامله
+2️⃣ طمع: «بیشتر بگیرم» → حد سود رو نمی‌بندی و سود می‌شه ضرر. راه‌حل: حد سود از قبل مشخص
+3️⃣ انتقام: بعد ضرر، معامله بزرگ‌تر برای جبران → حساب می‌سوزه. راه‌حل: بعد از هر ضرر، ۱ ساعت استراحت
+4️⃣ امید: «برمی‌گرده» → نگه‌داشتن معامله ضررده بدون حد ضرر. راه‌حل: SL رو بات می‌ذاره، تو تغییرش نده
+
+قوانین ذهن حرفه‌ای:
+▪️ ژورنال بنویس: هر معامله با دلیل ورود/خروج و احساسات
+▪️ ضرر بخشی از بازیه — تریدر خوب با وین‌ریت ۵۰٪ هم سودده‌ست چون R/R بالاست
+▪️ بازار هر روزه — فرصت فردا هم هست، حساب تو نه
+
+تمرین: بعد از هر معامله، تو ژورنالت بنویس «چه حسی داشتم؟»`},
+      {t:"ورود به فیوچرز", body:`⚡ درس ۸ — ورود به فیوچرز
+
+فیوچرز = معامله با اهرم. هم سود چند برابر، هم ضرر.
+
+مفاهیم پایه:
+▪️ لانگ: خرید در انتظار رشد | شورت: فروش در انتظار ریزش
+▪️ اهرم (Leverage): 10x یعنی با ۱۰۰$، پوزیشن ۱۰۰۰$ — حرکت ۱۰٪ برخلاف تو =清算 (لیکویید!)
+▪️ لیکویید: وقتی ضرر به کل مارجینت برسه، پوزیشن خودکار بسته می‌شه
+▪️ فاندینگ: هزینه‌ای که هر ۸ ساعت بین لانگ و شورت جابه‌جا می‌شه — فاندینگ بالا = طرف پر ازدحام (ریسک)
+▪️ مارجین ایزوله: اگه یه معامله ببازه بقیه حساب سالمه — برای شروع همیشه ایزوله!
+
+قوانین طلایی شروع:
+۱. اول ۱ ماه با ۲x در دمو یا حجم خیلی کم معامله کن
+۲. اهرم بیشتر از ۳x برای شروع = خودکشی مالی
+۳. همیشه SL بذار — بدون حد ضرر وارد فیوچرز نشو
+۴. فقط در جهت روند تایم بزرگ معامله کن
+۵. فاندینگ رو چک کن: /chart BTC نرخ فاندینگ لحظه‌ای رو نشون می‌ده
+
+هشدار: فیوچرز برای حرفه‌ای‌هاست. اگه اسپات رو کامل یاد نگرفتی، فیوچرز نرو.`},
+    ];
+    const m = /^\/learn\s*(\d+)?$/.exec(text.trim());
+    if (!m || !m[1]) {
+      const idx = await dbGet<number>("lesson_" + chatId, 0);
+      return `🎓 آکادمی سیگنال‌یار — ۸ درس از صفر تا فیوچرز
+
+${LESSONS.map((l,i)=>`${i+1}. ${l.t}${i+1===idx+1 ? " ← آخرین درس خوانده‌شده" : ""}`).join("\n")}
+
+📖 متن هر درس: /learn 1 تا /learn 8
+🧮 بعد از درس ۶: /calc — ماشین‌حساب مدیریت سرمایه
+📊 تمرین هر درس با: /chart و /signal
+
+💡 پیشنهاد: به ترتیب برو — هر درس روی قبلی سوار می‌شه.`;
+    }
+    const n = Math.min(Math.max(parseInt(m[1]), 1), LESSONS.length);
+    await dbSet("lesson_" + chatId, n-1);
+    const l = LESSONS[n-1];
+    return `${l.body}\n\n➡️ درس بعدی: /learn ${n+1 > LESSONS.length ? "(تمام شد! حالا /calc و /signal رو امتحان کن)" : n+1}`;
+  }
+  // ---------- position size calculator ----------
+  if (text.startsWith("/calc")) {
+    const parts = text.split(/\s+/);
+    // /calc <capital> <risk%> <entry> <stop>  OR  /calc (guide)
+    if (parts.length >= 5) {
+      const cap = parseFloat(parts[1]), risk = parseFloat(parts[2]), entry = parseFloat(parts[3]), stop = parseFloat(parts[4]);
+      if ([cap, risk, entry, stop].some(v => !isFinite(v) || v <= 0)) return "⚠️ اعداد معتبر نیست. مثال: /calc 1000 1 82000 80000";
+      const riskAmt = cap * risk / 100;
+      const dist = Math.abs(entry - stop) / entry * 100;
+      if (dist === 0) return "⚠️ ورود و حد ضرر یکی‌ان!";
+      const posSize = riskAmt / (dist / 100);
+      const lev = Math.min(Math.max(posSize / cap, 1), 10);
+      return `🧮 ماشین‌حساب مدیریت سرمایه
+
+💵 سرمایه: ${cap.toLocaleString("en-US")}$
+🎯 ریسک: ${risk}% (${riskAmt.toLocaleString("en-US")}$)
+📌 ورود: ${entry.toLocaleString("en-US")}$ | حد ضرر: ${stop.toLocaleString("en-US")}$ (فاصله ${dist.toFixed(2)}%)
+
+📐 حجم پوزیشن: ${posSize.toLocaleString("en-US",{maximumFractionDigits:2})}$
+⚙️ اهرم لازم: ${lev.toFixed(1)}x
+✅ اگه SL بخوره: فقط -${riskAmt.toLocaleString("en-US")}$ ازت کم می‌شه (با اهرم)
+
+💡 نکته: با نسبت 1:1.5 حد سود رو بذار ${dist*1.5 > 0 ? (entry + (entry-stop)*1.5).toLocaleString("en-US",{maximumFractionDigits:0}) : ""}$
+⚠️ اهرم بالای 3x برای شروع توصیه نمی‌شه`;
+    }
+    return `🧮 ماشین‌حساب مدیریت سرمایه
+
+فرمت: /calc سرمایه ریسک٪ ورود حد‌ضرر
+
+مثال: /calc 1000 1 82000 80000
+یعنی: ۱۰۰۰$ سرمایه، حاضرم ۱٪ (۱۰$) ریسک کنم، ورود ۸۲۰۰۰، حد ضرر ۸۰۰۰۰
+
+بات بهت می‌گه: حجم پوزیشن چقدر باشه و چه اهرمی لازمه.
+
+📚 یادآوری: ریسک استاندارد هر معامله ۱-۲٪ است (درس ۶ آکادمی: /learn 6)`;
   }
   if (text.startsWith("/price")) {
     const parts = text.split(" ");
@@ -313,6 +548,51 @@ async function handleMessage(chatId: number, text: string) {
     });
     return `🏆 رتبه‌بندی بازار (۲۵ ارز برتر از نظر حجم)\nقوی → ضعیف:\n\n` + lines.join("\n")
       + `\n\n📏 امتیاز از +۶ (بسیار صعودی) تا -۶ (بسیار نزولی) — ترکیب RSI، MACD، بولینگر و ساختار بازار\n\n⚠️ توصیه سرمایه‌گذاری نیست`;
+  }
+  // ---------- live chart anatomy: candles + trend + patterns + funding ----------
+  if (text.startsWith("/chart")) {
+    const parts = text.split(" ");
+    let sym = (parts[1]?.toUpperCase() ?? "BTC");
+    if (!sym.endsWith("USDT")) sym += "USDT";
+    try {
+      const ks = await klines(sym, "1h", 100);
+      const closes = ks.map(k => Number(k[4]));
+      const price = closes[closes.length-1];
+      const tr = trendInfo(closes);
+      const pats = candlePatterns(ks);
+      const sr = srLevels(closes);
+      const fmt = (v:number, d=2) => v >= 1000 ? v.toLocaleString("en-US",{maximumFractionDigits:0}) : v >= 1 ? v.toLocaleString("en-US",{maximumFractionDigits:d}) : v.toLocaleString("en-US",{maximumFractionDigits:4});
+      // last 3 candles mini-view
+      let view = "";
+      for (let i = ks.length-3; i < ks.length; i++) {
+        const o = Number(ks[i][1]), c = Number(ks[i][4]), h = Number(ks[i][2]), l = Number(ks[i][3]);
+        const ch = (c/o-1)*100;
+        view += `${c>=o?"🟢":"🔴"} ${fmt(o)}→${fmt(c)} (H:${fmt(h)} L:${fmt(l)}) ${ch>=0?"+":""}${ch.toFixed(2)}%\n`;
+      }
+      // funding rate (futures)
+      let fundLine = "";
+      try {
+        const f = await (await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${sym}`)).json();
+        if (f.lastFundingRate !== undefined) {
+          const fr = Number(f.lastFundingRate)*100;
+          fundLine = `⚡ فاندینگ فیوچرز: ${fr.toFixed(4)}% ${fr>0.02?"(لانگ‌ها به شورت‌ها می‌دن — ازدحام خرید ⚠️)":fr<-0.02?"(شورت‌ها به لانگ‌ها می‌دن — ازدحام فروش)":"(نرمال)"}`;
+        }
+      } catch {}
+      return `📊 آناتومی چارت ${sym}
+
+🕯 ۳ کندل اخیر (1h):
+${view}
+🧭 روند: ${tr.dir}
+   ${tr.desc}
+📐 الگوهای کندلی شناسایی‌شده:
+${pats.length ? pats.map(p=>"• "+p).join("\n") : "• الگوی خاصی روی کندل آخر نیست (کندل معمولی)"}
+🧱 حمایت: ${fmt(sr.sup)}$ | مقاومت: ${fmt(sr.res)}$
+💵 قیمت الان: ${fmt(price)}$
+${fundLine}
+
+💡 تحلیلش کن: روند + الگو + جای قیمت نسبت به S/R رو با هم بخون (درس‌های ۱-۴: /learn)
+⚠️ توصیه سرمایه‌گذاری نیست`;
+    } catch { return `⚠️ داده چارت ${sym} در دسترس نیست. مثال: /chart BTC`; }
   }
   if (text === "/top") {
     const rows: {sc:number,sym:string,p:number,r:number}[] = [];
