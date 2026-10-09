@@ -266,7 +266,7 @@ async function handleMessage(chatId: number, text: string) {
   if (text === "/start" || text === "/help") {
     const subs = await dbGet<number[]>("subs", memSubs);
     if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
-    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز (قوی→ضعیف)\n/trend — نبض شبکه‌های اجتماعی و ترندها\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+    return "👋 سلام! من سیگنال‌یارم 🤖\n\nدستورات:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال واقعی\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز (قوی→ضعیف)\n/brief — جمع‌بندی روزانه و بهترین گزینه‌ها\n/trend — نبض شبکه‌های اجتماعی و ترندها\n/news — اخبار بازار\n/stats — کارنامه واقعی\n/models — انتخاب هوش مصنوعی\n/subscribe — سیگنال خودکار\n/unsubscribe — لغو\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
   }
   if (text.startsWith("/price")) {
     const parts = text.split(" ");
@@ -328,6 +328,65 @@ async function handleMessage(chatId: number, text: string) {
     }
     const raw = "📰 آخرین اخبار بازار:\n\n" + news.slice(0,6).map(t=>"🔹 "+t).join("\n\n");
     return await newsDigest(news.slice(0,6), "آخرین اخبار بازار رمزارز") ?? raw;
+  }
+  if (text === "/brief") {
+    // all-in-one daily briefing: news + social + F&G + full TA on top-25 → AI verdict
+    let data = "";
+    // 1) technical scan
+    try {
+      const syms = await topSymbols(25);
+      const ranked = await rankScan(syms);
+      if (ranked.length) {
+        data += "## رتبه‌بندی تکنیکال ۲۵ ارز برتر (امتیاز -۶ تا +۶: RSI، MACD، بولینگر، ساختار):\n";
+        data += ranked.slice(0, 12).map(x=>`${x.sym.replace("USDT","")}: ${x.sc>=0?"+":""}${x.sc} (قیمت ${x.p.toLocaleString("en-US")}$, RSI ${x.rsi.toFixed(0)})`).join("\n");
+        data += "\n";
+      }
+    } catch {}
+    // 2) sentiment & social
+    try {
+      const f = await (await fetch("https://api.alternative.me/fng/?limit=1")).json();
+      const d = f.data?.[0];
+      if (d) data += `\n## شاخص ترس و طمع: ${d.value}/100 (${d.value_classification})\n`;
+    } catch {}
+    try {
+      const j = await (await fetch("https://data-api.binance.vision/api/v3/ticker/24hr")).json();
+      const usdt = (Array.isArray(j)?j:[]).filter((t:any)=>typeof t.symbol==="string" && t.symbol.endsWith("USDT") && Number(t.quoteVolume)>5e6 && !/(UP|DOWN|BULL|BEAR)USDT$/.test(t.symbol));
+      const ups = usdt.filter((t:any)=>Number(t.priceChangePercent)>0).length;
+      const g = [...usdt].sort((a:any,b:any)=>Number(b.priceChangePercent)-Number(a.priceChangePercent)).slice(0,4);
+      const l = [...usdt].sort((a:any,b:any)=>Number(a.priceChangePercent)-Number(b.priceChangePercent)).slice(0,4);
+      data += `\n## عرض و تقاضا: ${ups} سبز از ${usdt.length} ارز پرحجم (${(ups/usdt.length*100).toFixed(0)}% سبز)\n`;
+      data += `پامپ‌ها: ${g.map((t:any)=>`${t.symbol.replace("USDT","")} +${Number(t.priceChangePercent).toFixed(0)}%`).join(", ")}\n`;
+      data += `دامپ‌ها: ${l.map((t:any)=>`${t.symbol.replace("USDT","")} ${Number(t.priceChangePercent).toFixed(0)}%`).join(", ")}\n`;
+    } catch {}
+    try {
+      const t = await (await fetch("https://api.coingecko.com/api/v3/search/trending")).json();
+      const hot = (t.coins||[]).slice(0,5).map((c:any)=>c.item?.symbol).filter(Boolean);
+      if (hot.length) data += `\n## داغ‌های شبکه‌های اجتماعی (بیشترین جستجو): ${hot.join(", ")}\n`;
+    } catch {}
+    // 3) news headlines
+    try {
+      const news = await fetchNews(8);
+      if (news.length) data += `\n## عناوین اخبار:\n` + news.slice(0,8).map(t=>"• "+t).join("\n") + "\n";
+    } catch {}
+    if (!data) return "⚠️ الان داده کافی جمع نشد، بعداً امتحان کن.";
+    // 4) AI verdict
+    try {
+      const r = await fetch(LLM_URL, {
+        method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
+        body: JSON.stringify({model:"auto", max_tokens:2000, messages:[
+          {role:"system", content:"تو یک تحلیلگر ارشد بازار رمزارز هستی. فارسی روان، خلاصه و بدون اغراق می‌نویسی. همیشه یادآوری می‌کنی که تصمیم نهایی با کاربر است و این توصیه نیست."},
+          {role:"user", content:`این داده‌های واقعی و لحظه‌ای بازار است (تکنیکال، احساسات، اجتماعی، اخبار). یک جمع‌بندی روزانه کوتاه (حداکثر ۱۲ خط) بنویس با این ساختار:\n\n۱. «وضعیت بازار:» — ۲-۳ خط جمع‌بندی کلی بر اساس همه داده‌ها (چرا این وضعیت؟ به اعداد ارجاع بده)\n۲. «بهترین گزینه‌ها:» — حداکثر ۲ ارز که بر اساس داده‌ها بهترین موقعیت دارند، هرکدام یک خط با دلیل مشخص (ترکیب تکنیکال + خبر/ترند)\n۳. «ریسک‌ها:» — ۱-۲ خط (مثلاً پامپ بی‌پشتوانه، طمع بالا، خبر منفی)\n۴. «توصیه عملی:» — یک جمله (نظاره/ورود محتاطانه و...) \n\nاگر داده‌ها سیگنال قوی نشان نمی‌دهند، صادقانه بگو «الان موقعیت خوبی نیست، نظاره بهتره». حدس نزن، فقط از داده‌های زیر استفاده کن:\n\n${data}`}]})
+      });
+      const j = await r.json();
+      const ai = (j.choices?.[0]?.message?.content || "").trim();
+      if (ai) {
+        console.log(`[brief] ok len=${ai.length}`);
+        return `🧭 جمع‌بندی روزانه سیگنال‌یار\n\n${ai}\n\n⚠️ این تحلیل خودکار است و توصیه سرمایه‌گذاری نیست — تصمیم نهایی با خودته`;
+      }
+      console.log(`[brief] empty status=${r.status} err=${JSON.stringify(j.error ?? null)}`);
+    } catch (e) { console.log(`[brief] ERR: ${e instanceof Error ? e.message : e}`); }
+    // fallback: raw data view
+    return "🧭 جمع‌بندی روزانه (داده خام — هوش مصنوعی موقتاً در دسترس نیست):\n\n" + data + "\n⚠️ توصیه سرمایه‌گذاری نیست";
   }
   if (text === "/trend" || text.startsWith("/trend ")) {
     // social/trend pulse: where the money & attention is going
