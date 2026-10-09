@@ -206,6 +206,27 @@ async function fetchNews(n = 6): Promise<string[]> {
   }
   return items.slice(0, n);
 }
+// summarize news in Persian via the default LLM (GLM) — returns null on failure so caller falls back to raw titles
+async function newsDigest(titles: string[], label: string): Promise<string | null> {
+  if (!titles.length) return null;
+  try {
+    const prompt = `این عناوین خبری بازار رمزارز را به فارسی تحلیل و جمع‌بندی کن. برای هر خبر یک خط فارسی کوتاه بنویس (ترجمه + نکته مهم), سپس در پایان یک پاراگراف «جمع‌بندی» بنویس که: وضعیت کلی بازار را بگوید، کدام اخبار مثبت/منفی‌اند و چه اثری بر قیمت‌ها دارند. اگر به‌نظرت خبری مهم/تأثیرگذار است با 🔴 یا 🟢 علامت بزن. لحن حرفه‌ای و کوتاه. این ترجمه فارسی است، نه توضیح ساختار:\n\n${titles.map((t,i)=>`${i+1}. ${t}`).join("\n")}`;
+    const r = await fetch(LLM_URL, {
+      method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${LLM_KEY}`},
+      body: JSON.stringify({model:"auto", max_tokens:2000, messages:[
+        {role:"system", content:"تو یک تحلیلگر خبری بازار رمزارز هستی که فقط فارسی روان می‌نویسد."},
+        {role:"user", content: prompt}]})
+    });
+    const j = await r.json();
+    const out = (j.choices?.[0]?.message?.content || "").trim();
+    if (!out) { console.log(`[news] digest empty status=${r.status} err=${JSON.stringify(j.error ?? null)}`); return null; }
+    console.log(`[news] digest ok len=${out.length}`);
+    return `📰 ${label} (خلاصه فارسی):\n\n${out}\n\n⚠️ توصیه سرمایه‌گذاری نیست`;
+  } catch (e) {
+    console.log(`[news] digest ERR: ${e instanceof Error ? e.message : e}`);
+    return null;
+  }
+}
 
 // ---------- telegram ----------
 async function tg(method: string, body: any) {
@@ -300,9 +321,13 @@ async function handleMessage(chatId: number, text: string) {
     if (parts[1]) {
       const base = parts[1].toUpperCase().replace("USDT","");
       const rel = news.filter(t=>t.toLowerCase().includes(base.toLowerCase()) || (base==="BTC"&&t.toLowerCase().includes("bitcoin")));
-      if (rel.length) return `📰 اخبار ${base}:\n\n` + rel.slice(0,5).map(t=>"🔹 "+t).join("\n\n");
+      if (rel.length) {
+        const raw = `📰 اخبار ${base}:\n\n` + rel.slice(0,5).map(t=>"🔹 "+t).join("\n\n");
+        return await newsDigest(rel.slice(0,5), `اخبار مرتبط با ${base}`) ?? raw;
+      }
     }
-    return "📰 آخرین اخبار بازار:\n\n" + news.slice(0,6).map(t=>"🔹 "+t).join("\n\n");
+    const raw = "📰 آخرین اخبار بازار:\n\n" + news.slice(0,6).map(t=>"🔹 "+t).join("\n\n");
+    return await newsDigest(news.slice(0,6), "آخرین اخبار بازار رمزارز") ?? raw;
   }
   if (text === "/stats" || text === "/states") {
     const sigs = await dbGet<any[]>("signals", []);
