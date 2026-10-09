@@ -48,6 +48,13 @@ async function dbSet(key: string, val: unknown) {
   if (kv) await kv.set(["sy", key], val);
 }
 
+// ---------- admin ----------
+// Owner chat id (user's own telegram). Admin-only commands live here.
+const OWNER_ID = 57845137;
+const isAdmin = (chatId: number) => chatId === OWNER_ID;
+// models available to regular users: GLM only (stable, no key juggling). Admin can still switch via /admin model orN.
+function isModelLockedFor(chatId: number) { return !isAdmin(chatId); }
+
 // ---------- TA ----------
 async function klines(sym: string, interval = "1h", limit = 200): Promise<number[][]> {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -467,6 +474,10 @@ async function handleMessage(chatId: number, text: string) {
   }
   if (text === "/models") {
     const cur = await dbGet<string>("model_" + chatId, "glm");
+    if (isModelLockedFor(chatId)) {
+      // regular users: model is fixed to GLM for everyone (stability + no per-user key juggling)
+      return "🧠 هوش مصنوعی این بات: GLM (پیش‌فرض و پایدار)\n\nبرای همه کاربران یکسان است. اگر مدل انتخابی دلخواه می‌خوای، به پشتیبانی پیام بده 🙏";
+    }
     let list = "✅ /model glm — GLM (پیش‌فرض، سریع)\n";
     if (OPENROUTER_KEY) {
       const frees = (await fetchFreeModels()).filter(m => {
@@ -486,6 +497,9 @@ async function handleMessage(chatId: number, text: string) {
     return "🧠 هوش مصنوعی‌های موجود:\n\n" + list;
   }
   if (text.startsWith("/model ")) {
+    if (isModelLockedFor(chatId)) {
+      return "🔒 تغییر مدل فقط برای مدیر فعال است. هوش مصنوعی فعلی: GLM (پایدار برای همه).";
+    }
     const key = text.split(" ")[1]?.toLowerCase().trim();
     if (!key) return "⚠️ مدل رو مشخص کن. لیست: /models";
     if (key === "glm") {
@@ -512,6 +526,65 @@ async function handleMessage(chatId: number, text: string) {
     const subs = await dbGet<number[]>("subs", memSubs);
     await dbSet("subs", subs.filter(x=>x!==chatId));
     return "❌ لغو شد.";
+  }
+  // ---------- admin panel (owner only) ----------
+  if (text.startsWith("/admin")) {
+    if (!isAdmin(chatId)) return "🔒 این بخش فقط برای مدیر بات است.";
+    const arg = text.slice(6).trim();
+    // /admin — show dashboard
+    if (!arg) {
+      const subs = await dbGet<number[]>("subs", memSubs);
+      const sigs = await dbGet<any[]>("signals", []);
+      const pending = sigs.filter(s=>!s.checked).length;
+      const model = await dbGet<string>("model_" + chatId, "glm");
+      return `🛠 پنل مدیریت سیگنال‌یار\n\n👥 مشترکین سیگنال خودکار: ${subs.length}\n📊 سیگنال‌های ذخیره‌شده: ${sigs.length} (در انتظار ارزیابی: ${pending})\n🧠 مدل چت تو: ${model.startsWith("or:") ? "OpenRouter (" + model.slice(3) + ")" : "GLM"}\n🔐 دسترسی: مدیر (تو)\n\nدستورات مدیریتی:\n/admin users — لیست مشترکین\n/admin broadcast <متن> — پیام همگانی\n/admin model orN|glm — تغییر مدل چت خودت\n/admin stats — کارنامه کامل با جزئیات\n/admin locks — وضعیت قفل‌ها`;
+    }
+    if (arg === "users") {
+      const subs = await dbGet<number[]>("subs", memSubs);
+      return `👥 مشترکین (${subs.length}):\n` + (subs.length ? subs.map((id,i)=>`${i+1}. ${id}${id===OWNER_ID?" (تو)":""}`).join("\n") : "هیچ‌کس");
+    }
+    if (arg.startsWith("broadcast ")) {
+      const msg = arg.slice(10).trim();
+      if (!msg) return "⚠️ متن پیام رو بنویس: /admin broadcast سلام";
+      const subs = await dbGet<number[]>("subs", memSubs);
+      let sent = 0, failed = 0;
+      for (const cid of subs) {
+        try { const r = await tg("sendMessage", {chat_id: cid, text: `📣 پیام مدیر:\n\n${msg}`}); if (r.ok) sent++; else failed++; }
+        catch { failed++; }
+      }
+      console.log(`[admin] broadcast sent=${sent} failed=${failed}`);
+      return `📣 پیام همگانی ارسال شد: ${sent} موفق، ${failed} ناموفق (از ${subs.length} مشترک)`;
+    }
+    if (arg === "model" || arg.startsWith("model ")) {
+      const key = arg.split(" ")[1]?.toLowerCase().trim();
+      if (!key) {
+        const cur = await dbGet<string>("model_" + chatId, "glm");
+        let list = "مدل فعلی تو: " + (cur.startsWith("or:") ? cur.slice(3) : "GLM") + "\n\n✅ /admin model glm\n";
+        if (OPENROUTER_KEY) {
+          const frees = (await fetchFreeModels()).filter(m => !/inkling|content-safety|code/i.test(m.id));
+          list += frees.slice(0, 10).map((m, i) => `/admin model or${i+1} — ${m.name}`).join("\n");
+        }
+        return list;
+      }
+      if (key === "glm") { await dbSet("model_" + chatId, "glm"); return "✅ مدل چت تو: GLM"; }
+      const frees = await fetchFreeModels();
+      const m = /^or(\d+)$/.exec(key);
+      const idx = m ? parseInt(m[1]) - 1 : -1;
+      if (idx < 0 || idx >= frees.length) return "⚠️ شماره نامعتبر";
+      await dbSet("model_" + chatId, "or:" + frees[idx].id);
+      return `✅ مدل چت تو: ${frees[idx].name}`;
+    }
+    if (arg === "stats") {
+      const sigs = await dbGet<any[]>("signals", []);
+      const done = sigs.filter(s=>s.checked);
+      const last = sigs.slice(-10).reverse().map(s =>
+        `${s.sym.replace("USDT","")} ${s.side} | ورود ${Number(s.entry).toLocaleString("en-US")}$ | ${s.checked ? (s.result==="win"?"✅ سود":s.result==="loss"?"❌ ضرر":"➖ خنثی") : "⏳ در جریان"}`);
+      return `📊 جزئیات سیگنال‌ها (${sigs.length} کل، ${done.length} ارزیابی‌شده):\n\n` + (last.join("\n") || "هنوز سیگنالی ثبت نشده");
+    }
+    if (arg === "locks") {
+      return `🔐 وضعیت قفل‌ها:\n\n🧠 انتخاب مدل برای کاربران عادی: 🔒 قفل روی GLM\n🛠 پنل /admin: فقط مدیر (تو)\n📊 دستورات تحلیلی: آزاد برای همه\n📢 subscribe: آزاد برای همه\n\n(قفل مدل توسط کد ثابت شده — برای تغییر باید کد آپدیت بشه)`;
+    }
+    return "⚠️ زیردستور نامعتبر. /admin را بدون آرگومان بزن.";
   }
   if (text.startsWith("/")) {
     return "🤖 این دستور رو نشناختم!\n\n/price /signal /top /rank /news /stats /models /subscribe\n\nیا آزادانه سؤال بپرس 💬";
