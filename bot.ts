@@ -54,6 +54,11 @@ const OWNER_ID = 57845137;
 const isAdmin = (chatId: number) => chatId === OWNER_ID;
 // models available to regular users: GLM only (stable, no key juggling). Admin can still switch via /admin model orN.
 function isModelLockedFor(chatId: number) { return !isAdmin(chatId); }
+// banned users: admin can block/unblock via /admin block|unblock <id>. Banned users get silence everywhere.
+async function isBanned(chatId: number): Promise<boolean> {
+  const list = await dbGet<number[]>("banned", []);
+  return list.includes(chatId);
+}
 
 // ---------- TA ----------
 async function klines(sym: string, interval = "1h", limit = 200): Promise<number[][]> {
@@ -537,11 +542,48 @@ async function handleMessage(chatId: number, text: string) {
       const sigs = await dbGet<any[]>("signals", []);
       const pending = sigs.filter(s=>!s.checked).length;
       const model = await dbGet<string>("model_" + chatId, "glm");
-      return `🛠 پنل مدیریت سیگنال‌یار\n\n👥 مشترکین سیگنال خودکار: ${subs.length}\n📊 سیگنال‌های ذخیره‌شده: ${sigs.length} (در انتظار ارزیابی: ${pending})\n🧠 مدل چت تو: ${model.startsWith("or:") ? "OpenRouter (" + model.slice(3) + ")" : "GLM"}\n🔐 دسترسی: مدیر (تو)\n\nدستورات مدیریتی:\n/admin users — لیست مشترکین\n/admin broadcast <متن> — پیام همگانی\n/admin model orN|glm — تغییر مدل چت خودت\n/admin stats — کارنامه کامل با جزئیات\n/admin locks — وضعیت قفل‌ها`;
+      return `🛠 پنل مدیریت سیگنال‌یار\n\n👥 مشترکین سیگنال خودکار: ${subs.length}\n📊 سیگنال‌های ذخیره‌شده: ${sigs.length} (در انتظار ارزیابی: ${pending})\n🧠 مدل چت تو: ${model.startsWith("or:") ? "OpenRouter (" + model.slice(3) + ")" : "GLM"}\n🔐 دسترسی: مدیر (تو)\n\nدستورات مدیریتی:\n/admin users — لیست کاربران (با آیدی برای مسدودکردن)\n/admin block <id> — مسدودکردن کاربر (بی‌پاسخ کامل)\n/admin unblock <id> — رفع مسدودی\n/admin banned — لیست مسدودشده‌ها\n/admin broadcast <متن> — پیام همگانی\n/admin model orN|glm — تغییر مدل چت خودت\n/admin stats — کارنامه کامل با جزئیات\n/admin locks — وضعیت قفل‌ها`;
     }
     if (arg === "users") {
-      const subs = await dbGet<number[]>("subs", memSubs);
-      return `👥 مشترکین (${subs.length}):\n` + (subs.length ? subs.map((id,i)=>`${i+1}. ${id}${id===OWNER_ID?" (تو)":""}`).join("\n") : "هیچ‌کس");
+      const users = await dbGet<any[]>("users", []);
+      const banned = await dbGet<number[]>("banned", []);
+      if (!users.length) return "👥 هنوز کاربری ثبت نشده.";
+      const fmt = (u:any) => {
+        const nm = u.name || u.username || "";
+        const un = u.username ? ` @${u.username}` : "";
+        const b = banned.includes(u.id) ? " 🚫مسدود" : "";
+        const me = u.id === OWNER_ID ? " (تو)" : "";
+        const lastAgo = Math.round((Date.now()-(u.last||u.first||Date.now()))/3600e3);
+        return `${u.id}${me}${un} — ${nm}${b} | آخرین فعالیت: ${lastAgo>=1 ? lastAgo+" ساعت پیش" : "همین الان"}`;
+      };
+      return `👥 کاربران (${users.length}):\n\n` + users.map(fmt).join("\n") + `\n\n🚫 مسدودکردن: /admin block <id>\n♻️ رفع مسدودی: /admin unblock <id>`;
+    }
+    if (arg.startsWith("block ")) {
+      const id = parseInt(arg.slice(6).trim());
+      if (!id || id === OWNER_ID) return "⚠️ شناسه نامعتبر (نمی‌تونی خودت رو بلاک کنی). آیدی از /admin users";
+      const banned = await dbGet<number[]>("banned", []);
+      if (banned.includes(id)) return "ℹ️ همین الانم مسدوده.";
+      banned.push(id);
+      await dbSet("banned", banned);
+      // auto-remove from subscribers + wipe their chat memory
+      const subs = await dbGet<number[]>("subs", []);
+      await dbSet("subs", subs.filter(x=>x!==id));
+      memChats.delete(id);
+      console.log(`[admin] blocked user=${id}`);
+      return `🚫 کاربر ${id} مسدود شد.\n• از لیست مشترکین سیگنال حذف شد\n• از این به بعد پیام‌هاش بی‌پاسخ می‌مونه\n\nبرای رفع: /admin unblock ${id}`;
+    }
+    if (arg.startsWith("unblock ")) {
+      const id = parseInt(arg.slice(8).trim());
+      if (!id) return "⚠️ شناسه رو بنویس: /admin unblock <id>";
+      const banned = await dbGet<number[]>("banned", []);
+      if (!banned.includes(id)) return "ℹ️ این کاربر مسدود نیست.";
+      await dbSet("banned", banned.filter(x=>x!==id));
+      console.log(`[admin] unblocked user=${id}`);
+      return `♻️ کاربر ${id} رفع مسدودی شد — دوباره می‌تونه با بات کار کنه.`;
+    }
+    if (arg === "banned") {
+      const banned = await dbGet<number[]>("banned", []);
+      return `🚫 مسدودشده‌ها (${banned.length}):\n` + (banned.length ? banned.map(b=>`${b} — رفع: /admin unblock ${b}`).join("\n") : "هیچ‌کس");
     }
     if (arg.startsWith("broadcast ")) {
       const msg = arg.slice(10).trim();
@@ -734,9 +776,25 @@ Deno.serve(async (req: Request) => {
       const upd = await req.json();
       const m = upd.message;
       if (m?.chat?.id && m.text) {
-        const reply = await handleMessage(m.chat.id, m.text);
-        const sr = await tg("sendMessage", {chat_id: m.chat.id, text: reply});
-        console.log(`[send] ${sr.ok?"ok":"FAIL"} chat=${m.chat.id} len=${reply.length} head=${JSON.stringify(reply.slice(0,120))}`);
+        const cid = m.chat.id;
+        // banned users are ignored silently (no reply at all)
+        if (!isAdmin(cid) && await isBanned(cid)) {
+          console.log(`[banned] ignored chat=${cid}`);
+          return new Response("ok");
+        }
+        // record/refresh user directory (id, name, username, activity) for admin management
+        try {
+          const users = await dbGet<any[]>("users", []);
+          const now = Date.now();
+          const i = users.findIndex(u => u.id === cid);
+          const info = { id: cid, name: m.from?.first_name || m.chat?.first_name || "", username: m.from?.username || "", last: now };
+          if (i >= 0) users[i] = { ...users[i], ...info };
+          else users.push({ ...info, first: now });
+          await dbSet("users", users.slice(-2000));
+        } catch {}
+        const reply = await handleMessage(cid, m.text);
+        const sr = await tg("sendMessage", {chat_id: cid, text: reply});
+        console.log(`[send] ${sr.ok?"ok":"FAIL"} chat=${cid} len=${reply.length}`);
       }
     } catch (e) { console.error(e); }
     return new Response("ok");
