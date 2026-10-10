@@ -77,8 +77,13 @@ async function klines(sym: string, interval = "1h", limit = 200): Promise<number
   }
   throw new Error(`klines unavailable for ${sym}`);
 }
-function rsi(closes: number[], period = 14): number {
-  const gains: number[] = [], losses: number[] = [];
+// size-aware formatter (global — mentor/auto-signal both use it)
+function fmt(v: number, d = 2): string {
+  return v >= 1000 ? v.toLocaleString("en-US", { maximumFractionDigits: 0 })
+    : v >= 1 ? v.toLocaleString("en-US", { maximumFractionDigits: d })
+    : v.toLocaleString("en-US", { maximumFractionDigits: 4 });
+}
+function rsi(closes: number[], period = 14): number {  const gains: number[] = [], losses: number[] = [];
   for (let i = 1; i < closes.length; i++) {
     const d = closes[i] - closes[i-1];
     gains.push(Math.max(d, 0)); losses.push(Math.max(-d, 0));
@@ -321,7 +326,7 @@ async function handleMessage(chatId: number, text: string) {
   if (text === "/start" || text === "/help") {
     const subs = await dbGet<number[]>("subs", memSubs);
     if (!subs.includes(chatId)) { subs.push(chatId); await dbSet("subs", subs); }
-    return "👋 سلام! من سیگنال‌یارم 🤖\n\n📊 تحلیل:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال کامل\n/chart — کندل‌شناسی + روند + الگو + فاندینگ\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز\n/brief — جمع‌بندی روزانه\n/trend — نبض شبکه‌های اجتماعی\n/news — اخبار بازار\n/stats — کارنامه واقعی\n\n🎓 آموزش (آکادمی):\n/learn — فهرست درس‌ها (۸ درس)\n/learn 1 تا 8 — متن درس\n/calc — ماشین‌حساب مدیریت سرمایه\n\n⚙️ تنظیمات:\n/models — هوش مصنوعی\n/subscribe — سیگنال خودکار\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
+    return "👋 سلام! من سیگنال‌یارم 🤖\n\n📊 تحلیل:\n/price BTC — قیمت لحظه‌ای\n/signal — تحلیل تکنیکال کامل\n/chart — کندل‌شناسی + روند + الگو + فاندینگ\n/top — ۳ سیگنال برتر\n/rank — رتبه‌بندی ۲۵ ارز\n/brief — جمع‌بندی روزانه\n/trend — نبض شبکه‌های اجتماعی\n/news — اخبار بازار\n/stats — کارنامه واقعی\n\n🎓 آموزش (آکادمی):\n/learn — فهرست درس‌ها (۸ درس)\n/learn 1 تا 8 — متن درس\n/calc — ماشین‌حساب مدیریت سرمایه\n\n🧑‍🏫 مربی شخصی:\n/trade long BTC 82000 2 — ثبت معامله و شروع پایش\n/positions — معامله‌های باز\n/close BTC — بستن معامله\n/report — کارنامه شخصی و تحلیل مربی\n\n⚙️ تنظیمات:\n/models — هوش مصنوعی\n/subscribe — سیگنال خودکار\n\n💬 یا آزادانه بپرس.\n\n⚠️ تصمیم نهایی معامله با خودته";
   }
   // ---------- trading academy ----------
   if (text.startsWith("/learn")) {
@@ -593,6 +598,138 @@ ${fundLine}
 💡 تحلیلش کن: روند + الگو + جای قیمت نسبت به S/R رو با هم بخون (درس‌های ۱-۴: /learn)
 ⚠️ توصیه سرمایه‌گذاری نیست`;
     } catch { return `⚠️ داده چارت ${sym} در دسترس نیست. مثال: /chart BTC`; }
+  }
+  // ---------- personal mentor: live trade tracking ----------
+  if (text.startsWith("/trade")) {
+    // /trade long BTC 82000 2   (side symbol [entry [leverage]]) — entry defaults to live price
+    const p = text.split(/\s+/);
+    const side = (p[1] || "").toLowerCase();
+    if (side !== "long" && side !== "short") {
+      return `🧑‍🏫 حالت مربی — ثبت معامله
+
+فرمت: /trade long|short ارز [قیمت‌ورود] [اهرم]
+
+مثال: /trade long BTC 82000 2
+یعنی: لانگ بیت‌کوین، ورود ۸۲۰۰۰، اهرم ۲x
+
+اگه قیمت ورود رو ننویسی، قیمت لحظه‌ای بازار ثبت می‌شه.
+بعد از ثبت، من هر ۱۵ دقیقه چک می‌کنم:
+• حد ضرر یادت می‌ندازم (اگه نذاشتی!)
+• رو سود/زیان هشدار می‌دم
+• وسط راه تحلیل می‌دم
+
+📤 بستن معامله: /close BTC
+📋 معامله‌های باز: /positions`;
+    }
+    let sym = (p[2] || "BTC").toUpperCase();
+    if (!sym.endsWith("USDT")) sym += "USDT";
+    try {
+      const ks = await klines(sym, "1m", 2);
+      const live = Number(ks[ks.length-1][4]);
+      const entry = p[3] ? parseFloat(p[3]) : live;
+      const lev = p[4] ? Math.min(Math.max(parseFloat(p[4]) || 1, 1), 25) : 1;
+      if (!isFinite(entry) || entry <= 0) return "⚠️ قیمت ورود معتبر نیست. مثال: /trade long BTC 82000 2";
+      const opens = await dbGet<any[]>("trades_" + chatId, []);
+      if (opens.find(t => t.sym === sym)) return `⚠️ روی ${sym} یه معامله باز داری. اول ببندش: /close ${sym.replace("USDT","")}`;
+      const reg = await dbGet<number[]>("trade_chats", []);
+      if (!reg.includes(chatId)) { reg.push(chatId); await dbSet("trade_chats", reg); }
+      const k1h = await klines(sym, "1h", 50);
+      const a = atr(k1h);
+      const r = rsi(k1h.map(k => Number(k[4])));
+      const sl = side === "long" ? entry - 2*a : entry + 2*a;
+      const tp = side === "long" ? entry + 3*a : entry - 3*a;
+      const trade = { sym, side, entry, lev, at: Date.now(), sl, tp };
+      opens.push(trade);
+      await dbSet("trades_" + chatId, opens);
+      const dir = side === "long" ? "🟢 لانگ" : "🔴 شورت";
+      return `✅ ثبت شد — ${dir} ${sym} | اهرم ${lev}x
+
+📌 ورود: ${fmt(entry)}$
+🛑 حد ضرر پیشنهادی (2×ATR): ${fmt(sl)}$
+🎯 حد سود پیشنهادی (3×ATR): ${fmt(tp)}$
+📐 RSI الان: ${r.toFixed(0)}
+
+🧑‍🏫 مربی: ${side === "long" && r > 70 ? "⚠️ RSI بالای ۷۰ه — ورود در اشباع خرید، ریسک اصلاح بالاست. حجم رو کم کن." : side === "short" && r < 30 ? "⚠️ RSI زیر ۳۰ه — شورت در اشباع فروش، حواست باشه." : "شرایط ورودت رو همینجا ثبت کردم. هر ۱۵ دقیقه چکت می‌کنم و اگه اتفاق مهمی افتاد خبر می‌دم."}
+
+⚠️ حتماً حد ضرر واقعی توی صرافی بذار — من فقط هشدار می‌دم، پوزیشنت رو مدیریت نمی‌کنم!`;
+    } catch { return `⚠️ قیمت ${sym} در دسترس نیست.`; }
+  }
+  if (text.startsWith("/positions")) {
+    const opens = await dbGet<any[]>("trades_" + chatId, []);
+    if (!opens.length) return "📋 معامله بازی نداری. باز کردن: /trade long BTC 82000 2";
+    let out = "📋 معامله‌های باز:\n\n";
+    for (const t of opens) {
+      try {
+        const ks = await klines(t.sym, "1m", 2);
+        const live = Number(ks[ks.length-1][4]);
+        const pnl = (t.side === "long" ? live/t.entry-1 : t.entry/live-1) * 100 * t.lev;
+        out += `${t.side === "long" ? "🟢" : "🔴"} ${t.sym} | اهرم ${t.lev}x\n   ورود ${fmt(t.entry)}$ → الان ${fmt(live)}$\n   ${pnl >= 0 ? "🟩" : "🟥"} سود/ضرر: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}% (با اهرم)\n   🛑 SL ${fmt(t.sl)} | 🎯 TP ${fmt(t.tp)}\n\n`;
+      } catch { out += `⚠️ ${t.sym}: قیمت در دسترس نیست\n\n`; }
+    }
+    out += "📤 بستن: /close BTC";
+    return out;
+  }
+  if (text.startsWith("/close")) {
+    const p = text.split(/\s+/);
+    let sym = (p[1] || "").toUpperCase();
+    if (!sym) return "⚠️ کدوم معامله؟ مثال: /close BTC";
+    if (!sym.endsWith("USDT")) sym += "USDT";
+    const opens = await dbGet<any[]>("trades_" + chatId, []);
+    const idx = opens.findIndex(t => t.sym === sym);
+    if (idx < 0) return `⚠️ روی ${sym} معامله بازی ندارم. /positions`;
+    const t = opens[idx];
+    let live = t.entry;
+    try { const ks = await klines(sym, "1m", 2); live = Number(ks[ks.length-1][4]); } catch {}
+    const pnlPct = (t.side === "long" ? live/t.entry-1 : t.entry/live-1) * 100;
+    const pnlLev = pnlPct * t.lev;
+    const hours = ((Date.now() - t.at) / 3600000).toFixed(1);
+    opens.splice(idx, 1);
+    await dbSet("trades_" + chatId, opens);
+    // record to personal track record
+    const rec = await dbGet<any[]>("mytrades_" + chatId, []);
+    rec.push({ sym, side: t.side, entry: t.entry, exit: live, pnlPct, pnlLev, lev: t.lev, at: t.at, closedAt: Date.now(), hours: Number(hours) });
+    await dbSet("mytrades_" + chatId, rec.slice(-300));
+    const win = pnlLev >= 0;
+    return `${win ? "🎉" : "😔"} معامله بسته شد — ${sym}
+
+${t.side === "long" ? "🟢 لانگ" : "🔴 شورت"} | اهرم ${t.lev}x | مدت: ${hours} ساعت
+ورود: ${fmt(t.entry)}$ → خروج: ${fmt(live)}$
+${win ? "🟩" : "🟥"} نتیجه: ${pnlLev >= 0 ? "+" : ""}${pnlLev.toFixed(2)}% (با اهرم ${t.lev}x)
+
+🧑‍🏫 مربی: ${pnlLev >= 5 ? "سود خوبی بود! یادت باشه بزرگ‌ترین اشتباه تریدرها اینه که بعد برد، بی‌احتیاط می‌شن." : win ? "سودده بود ✅ — تو ژورنالت بنویس دلیل ورودت چی بود تا الگوش رو پیدا کنی." : pnlLev > -3 ? "ضرر کوچیک — عالیه! همین مدیریت درستِ ریسکه. ضرر کم = زنده موندن." : "ضرر بزرگ بود. قانون مربی: بعد از ۲ ضرر پشت هم، ۲۴ ساعت معامله نکن. فرصت همیشه هست."}
+
+📊 کارنامه شخصی‌ت: /report`;
+  }
+  if (text === "/report") {
+    const rec = await dbGet<any[]>("mytrades_" + chatId, []);
+    if (!rec.length) return "📊 هنوز معامله‌ای ثبت نکردی. اولین معامله‌ت رو با /trade long BTC ثبت کن.";
+    const wins = rec.filter(r => r.pnlLev > 0);
+    const wr = (wins.length / rec.length * 100).toFixed(0);
+    const avg = rec.reduce((a, r) => a + r.pnlLev, 0) / rec.length;
+    const best = Math.max(...rec.map(r => r.pnlLev));
+    const worst = Math.min(...rec.map(r => r.pnlLev));
+    const longs = rec.filter(r => r.side === "long");
+    const shorts = rec.filter(r => r.side === "short");
+    const lw = longs.length ? (longs.filter(r => r.pnlLev > 0).length / longs.length * 100).toFixed(0) : "—";
+    const sw = shorts.length ? (shorts.filter(r => r.pnlLev > 0).length / shorts.length * 100).toFixed(0) : "—";
+    let advice = "";
+    if (rec.length >= 5) {
+      if (longs.length >= 3 && shorts.length >= 3 && Number(lw) > Number(sw) + 20) advice = "\n🧑‍🏫 مربی: تو لانگ بهتر عمل می‌کنی تا شورت — تمرکزت رو بذار روی همون.";
+      else if (shorts.length >= 3 && Number(sw) > Number(lw) + 20) advice = "\n🧑‍🏫 مربی: شورت‌هات قوی‌ترن — استعدادت تو بازار نزولیه!";
+      if (worst < -10) advice += "\n⚠️ یه ضرر خیلی بزرگ (-" + Math.abs(worst).toFixed(0) + "%) توی کارنامه‌ته — اهرم رو روی معامله‌های حساس کم کن.";
+    }
+    return `📊 کارنامه شخصی تو (${rec.length} معامله)
+
+🎯 وین‌ریت: ${wr}% (${wins.length} برد / ${rec.length - wins.length} باخت)
+📈 میانگین سود/ضرر هر معامله: ${avg >= 0 ? "+" : ""}${avg.toFixed(2)}%
+🏆 بهترین: +${best.toFixed(1)}% | 💀 بدترین: ${worst.toFixed(1)}%
+🟢 وین‌ریت لانگ: ${lw}% | 🔴 وین‌ریت شورت: ${sw}%
+⏱ میانگین مدت: ${(rec.reduce((a,r)=>a+(r.hours||0),0)/rec.length).toFixed(1)} ساعت
+${advice}
+
+${rec.length >= 10 ? (Number(wr) >= 50 && avg > 0 ? "🧑‍🏫 مربی: عملکردت از میانگین بازار بهتره — ادامه بده ولی بی‌احتیاط نشو." : avg <= 0 ? "🧑‍🏫 مربی: صادقانه — تا حالا ضررده‌ای. حجم معامله‌هات رو نصف کن و فقط با سیگنال‌های قوی (/signal) وارد شو تا ۵ معامله بعدی." : "🧑‍🏫 مربی: سوددهی — ولی قانون طلایی رو فراموش نکن: ریسک هر معامله حداکثر ۲٪.") : "🧑‍🏫 مربی: بعد از ۱۰ معامله، تحلیل عمیق‌تری بهت می‌دم — دیتا کمه هنوز."}
+
+⚠️ این گزارش بر اساس معامله‌هایی‌ه که خودت ثبت کردی`;
   }
   if (text === "/top") {
     const rows: {sc:number,sym:string,p:number,r:number}[] = [];
@@ -1037,6 +1174,54 @@ Deno.cron("auto signals", "0 */4 * * *", async () => {
     sigs.push({sym: row.sym, side, conf, entry: row.p, ts: Date.now(), checked: false, result: null,
       slPrice: Number(slPrice.toFixed(8)), tpPrice: Number(tpPrice.toFixed(8))});
     await dbSet("signals", sigs.slice(-500));
+  }
+});
+
+// ---------- cron: mentor trade watch every 15 min ----------
+Deno.cron("mentor watch", "*/15 * * * *", async () => {
+  // collect all chats with open trades (KV list is not enumerable; keep a registry)
+  let reg = await dbGet<number[]>("trade_chats", []);
+  let regChanged = false;
+  const now = Date.now();
+  for (const cid of reg) {
+    const opens = await dbGet<any[]>("trades_" + cid, []);
+    if (!opens.length) continue;
+    for (const t of opens) {
+      try {
+        const ks = await klines(t.sym, "1m", 2);
+        const live = Number(ks[ks.length-1][4]);
+        const pnl = (t.side === "long" ? live/t.entry-1 : t.entry/live-1) * 100;
+        const pnlLev = pnl * t.lev;
+        let alert = "";
+        if (now - t.at > 10*60*1000 && !t.slWarned) {
+          alert = `🧑‍🏫 مربی: ${t.sym} رو ${((now-t.at)/60000).toFixed(0)} دقیقه پیش باز کردی — حد ضرر واقعی رو توی صرافی گذاشتی؟ اگر نه همین الان بذار! پیشنهاد من: ${fmt(t.sl)}$`;
+          t.slWarned = true;
+          await dbSet("trades_" + cid, opens);
+        } else if (pnlLev <= -15) {
+          alert = `🚨 ${t.sym}: با اهرم ${t.lev}x روی ${pnlLev.toFixed(1)}%-ی! لیکویید نزدیکه — حد ضرر بذار یا حجم کم کن. الان قیمت: ${fmt(live)}$`;
+        } else if (pnlLev <= -7) {
+          alert = `🔴 ${t.sym}: ضرر ${pnlLev.toFixed(1)}% (با اهرم) — به حد ضرر پیشنهادی (${fmt(t.sl)}$) نزدیک می‌شی. برنامه‌ات چی بود؟`;
+        } else if (pnlLev >= 10) {
+          alert = `🟢 ${t.sym}: +${pnlLev.toFixed(1)}% سود! مربی می‌گه: حد ضرر رو بیار نقطه ورود (بی‌ریسکش کن) یا بخشی از سود رو ببند.`;
+        } else if (pnlLev >= 4) {
+          alert = `🟩 ${t.sym}: +${pnlLev.toFixed(1)}% — سود خوبه. اگه مومنتوم هنوز قویه نگه دار، وگرنه حد سود نزدیکه (${fmt(t.tp)}$).`;
+        }
+        if (alert) {
+          const r = await tg("sendMessage", {chat_id: cid, text: alert + "\n\n⚠️ تصمیم نهایی با خودته"});
+          console.log(`[mentor] chat=${cid} ${t.sym} pnl=${pnlLev.toFixed(1)}% sent=${r.ok}`);
+        }
+        // auto-detect closed position: price crossed the stored TP/SL
+        if ((t.side === "long" && (live <= t.sl || live >= t.tp)) || (t.side === "short" && (live >= t.sl || live <= t.tp))) {
+          const hit = (t.side === "long" ? live >= t.tp : live <= t.tp) ? "حد سود" : "حد ضرر";
+          const rec = await dbGet<any[]>("mytrades_" + cid, []);
+          const pnlAt = (t.side === "long" ? (hit==="حد سود"?t.tp:t.sl)/t.entry-1 : t.entry/(hit==="حد سود"?t.tp:t.sl)-1) * 100 * t.lev;
+          rec.push({ sym: t.sym, side: t.side, entry: t.entry, exit: hit==="حد سود"?t.tp:t.sl, pnlPct: pnlAt/t.lev, pnlLev: pnlAt, lev: t.lev, at: t.at, closedAt: now, hours: Number(((now-t.at)/3600000).toFixed(1)), auto: true });
+          await dbSet("mytrades_" + cid, rec.slice(-300));
+          await dbSet("trades_" + cid, opens.filter(x => x.sym !== t.sym));
+          await tg("sendMessage", {chat_id: cid, text: `📌 ${t.sym} به ${hit} رسید (${fmt(hit==="حد سود"?t.tp:t.sl)}$) — معامله رو بسته حساب کردم.\nنتیجه: ${pnlAt>=0?"+":""}${pnlAt.toFixed(1)}%\nاگه هنوز بازه بگو: /close ${t.sym.replace("USDT","")}\n\n📊 /report`});
+        }
+      } catch (e) { console.log(`[mentor] err ${t.sym}: ${e instanceof Error ? e.message : e}`); }
+    }
   }
 });
 
